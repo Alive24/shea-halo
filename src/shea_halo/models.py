@@ -101,6 +101,7 @@ class AgentDecision(StrictModel):
 
 class InvestigationResult(StrictModel):
     outcome: Outcome
+    turn_budget_exhausted: bool = False
     summary: str = Field(max_length=2_000)
     evidence: list[Evidence] = Field(default_factory=list, max_length=10)
     analysis_sha256: str | None = Field(default=None, min_length=64, max_length=64)

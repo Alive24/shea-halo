@@ -8,7 +8,14 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, TypeAlias
 
-from agents import Agent, RunConfig, Runner, function_tool
+from agents import (
+    Agent,
+    RunConfig,
+    RunErrorHandlerInput,
+    RunErrorHandlerResult,
+    Runner,
+    function_tool,
+)
 from inference_catalyst_tracing import (
     CatalystTracing,
     SpanKindValues,
@@ -53,6 +60,30 @@ ActionKind: TypeAlias = Literal["setup", "experiment", "verification"]
 _GIT_CONTROL_FILES = {".gitattributes", ".gitignore", ".gitmodules"}
 _MAX_SYNTHESIS_REPORT_CHARACTERS = 30_000
 _MAX_SYNTHESIS_REPORT_UTF8_BYTES = 120_000
+
+
+def turn_budget_checkpoint(
+    *,
+    max_turns: int,
+) -> AgentDecision:
+    """Return a fail-closed checkpoint when a bounded investigation uses its last turn."""
+
+    return AgentDecision(
+        outcome=Outcome.CONTINUE_RESEARCH,
+        summary=(
+            "The bounded investigator turn budget ended after local exploration. "
+            "Halo will checkpoint any resulting source changes for exact-revision "
+            "validation; research remains incomplete."
+        ),
+        residual_risks=[
+            (
+                f"The investigator reached its configured {max_turns}-turn limit. "
+                "The experimental checkpoint may be incomplete and cannot become "
+                "Todo in this run; a later investigation must re-enter the validated "
+                "checkpoint."
+            )
+        ],
+    )
 
 
 def canonical_trace_contract() -> str:
@@ -542,6 +573,20 @@ class Investigator:
             output_type=AgentDecision,
         )
 
+        turn_budget_exhausted = False
+
+        def checkpoint_at_turn_limit(
+            _handler_input: RunErrorHandlerInput[None],
+        ) -> RunErrorHandlerResult:
+            nonlocal turn_budget_exhausted
+            turn_budget_exhausted = True
+            return RunErrorHandlerResult(
+                final_output=turn_budget_checkpoint(
+                    max_turns=config.investigator_max_turns,
+                ),
+                include_in_history=False,
+            )
+
         tracing = setup(
             endpoint=validate_catalyst_sdk_base_endpoint(
                 os.getenv("CATALYST_OTLP_ENDPOINT") or config.observation.catalyst_sdk_base_endpoint
@@ -567,6 +612,7 @@ class Investigator:
                     prompt,
                     max_turns=config.investigator_max_turns,
                     run_config=RunConfig(tracing_disabled=True),
+                    error_handlers={"max_turns": checkpoint_at_turn_limit},
                 )
                 decision = result.final_output
                 if not isinstance(decision, AgentDecision):
@@ -595,6 +641,7 @@ class Investigator:
             )
         return InvestigationResult(
             outcome=outcome,
+            turn_budget_exhausted=turn_budget_exhausted,
             summary=decision.summary,
             evidence=decision.evidence,
             analysis_sha256=(

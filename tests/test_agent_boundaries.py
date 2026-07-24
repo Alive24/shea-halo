@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from agents import RunErrorHandlerResult
 from conftest import write_target_config
 
 from shea_halo.agent import (
@@ -24,6 +26,7 @@ from shea_halo.agent import (
     re_patch_paths,
     run_verification,
     target_environment,
+    turn_budget_checkpoint,
     validate_candidate_synthesis,
 )
 from shea_halo.config import HaloConfig
@@ -73,10 +76,6 @@ async def test_investigator_uses_configured_turn_budget(
         base_revision="1" * 40,
     )
     captured: dict[str, object] = {}
-    decision = AgentDecision(
-        outcome=Outcome.CONTINUE_RESEARCH,
-        summary="More evidence is needed.",
-    )
 
     class Span:
         def __enter__(self) -> Span:
@@ -97,7 +96,13 @@ async def test_investigator_uses_configured_turn_budget(
     async def run(_agent: object, prompt: str, **kwargs: object) -> object:
         captured.update(kwargs)
         captured["prompt"] = prompt
-        return SimpleNamespace(final_output=decision)
+        error_handlers = cast(dict[str, object], kwargs["error_handlers"])
+        handler = cast(
+            Callable[[object], RunErrorHandlerResult],
+            error_handlers["max_turns"],
+        )
+        handled = handler(object())
+        return SimpleNamespace(final_output=handled.final_output)
 
     monkeypatch.setattr("shea_halo.agent.IntegrationCatalog.load", lambda _self: [])
     monkeypatch.setattr("shea_halo.agent.discover_dependencies", lambda _path: {})
@@ -111,7 +116,7 @@ async def test_investigator_uses_configured_turn_budget(
     monkeypatch.setattr("shea_halo.agent.agent_span", lambda *_args, **_kwargs: Span())
     monkeypatch.setattr("shea_halo.agent.Runner.run", run)
 
-    await Investigator().run(
+    investigation = await Investigator().run(
         config=config,
         workspace=workspace,
         run_id="halo-26-turn-budget",
@@ -124,11 +129,27 @@ async def test_investigator_uses_configured_turn_budget(
     )
 
     assert captured["max_turns"] == 60
+    assert callable(cast(dict[str, object], captured["error_handlers"])["max_turns"])
+    assert investigation.turn_budget_exhausted is True
+    assert investigation.outcome == Outcome.CONTINUE_RESEARCH
+    assert investigation.selected_guides == []
     assert "Exploration tool-turn budget:\n60" in cast(str, captured["prompt"])
     assert "Do not spend exploratory\nturns reproducing publication" in cast(
         str,
         captured["prompt"],
     )
+
+
+def test_turn_budget_checkpoint_preserves_changes_without_claiming_completion() -> None:
+    decision = turn_budget_checkpoint(
+        max_turns=100,
+    )
+
+    assert decision.outcome == Outcome.CONTINUE_RESEARCH
+    assert decision.todo_handoff is None
+    assert decision.blocker is None
+    assert decision.guide_decisions == []
+    assert "100-turn limit" in decision.residual_risks[0]
 
 
 def test_canonical_trace_guidance_comes_from_the_installed_public_engine_model() -> None:

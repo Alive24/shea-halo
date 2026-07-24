@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -72,6 +73,53 @@ def _runtime_source_sha256(package_root: Path | None = None) -> str:
 
 
 _RUNTIME_SOURCE_SHA256 = _runtime_source_sha256()
+_MAX_RESIDUAL_RISKS = 12
+_TURN_BUDGET_CHECKPOINT_RISK = (
+    "The preliminary investigator exhausted its bounded turn budget. "
+    "This exact-revision checkpoint must remain in Halo Research for a "
+    "later investigation even if final synthesis recommends a terminal outcome."
+)
+
+
+def _bounded_residual_risks(
+    risks: Iterable[str],
+    *,
+    retain: Iterable[str] = (),
+) -> list[str]:
+    """Deduplicate risks while retaining harness-owned checkpoint evidence."""
+
+    retained = list(dict.fromkeys(retain))[:_MAX_RESIDUAL_RISKS]
+    retained_set = set(retained)
+    remaining = [risk for risk in dict.fromkeys(risks) if risk not in retained_set][
+        : _MAX_RESIDUAL_RISKS - len(retained)
+    ]
+    return [*remaining, *retained]
+
+
+def _checkpoint_invariant_risks(result: InvestigationResult) -> tuple[str, ...]:
+    if not result.turn_budget_exhausted:
+        return ()
+    return (
+        *result.residual_risks[:1],
+        _TURN_BUDGET_CHECKPOINT_RISK,
+    )
+
+
+def _validated_result_with_residual_risks(
+    result: InvestigationResult,
+    *,
+    add: Iterable[str] = (),
+    retain: Iterable[str] = (),
+) -> InvestigationResult:
+    updated = result.model_copy(
+        update={
+            "residual_risks": _bounded_residual_risks(
+                (*result.residual_risks, *add),
+                retain=retain,
+            )
+        }
+    )
+    return InvestigationResult.model_validate(updated.model_dump())
 
 
 class HaloService:
@@ -745,18 +793,15 @@ class HaloService:
                     baseline,
                 )
             except Exception as cleanup_exc:
+                cleanup_failure_risk = (
+                    "Revision-bound validation failed and its observation "
+                    "artifact could not be discarded safely: "
+                    f"{type(cleanup_exc).__name__}: "
+                    f"{sanitize_persisted_text(str(cleanup_exc))[:1_000]}"
+                )
                 blocked = preliminary_result.model_copy(
                     update={
                         "outcome": Outcome.BLOCKED,
-                        "residual_risks": [
-                            *preliminary_result.residual_risks,
-                            (
-                                "Revision-bound validation failed and its observation "
-                                "artifact could not be discarded safely: "
-                                f"{type(cleanup_exc).__name__}: "
-                                f"{sanitize_persisted_text(str(cleanup_exc))[:1_000]}"
-                            ),
-                        ],
                         "blocker": ExternalBlocker(
                             category="permission",
                             description=(
@@ -770,6 +815,14 @@ class HaloService:
                         ),
                         "blocker_verified": True,
                     }
+                )
+                blocked = _validated_result_with_residual_risks(
+                    blocked,
+                    add=(cleanup_failure_risk,),
+                    retain=(
+                        *_checkpoint_invariant_risks(preliminary_result),
+                        cleanup_failure_risk,
+                    ),
                 )
                 self._finish(
                     config=config,
@@ -800,18 +853,23 @@ class HaloService:
                     },
                 )
                 return
+            validation_failure_risk = (
+                "Revision-bound validation failed: "
+                f"{type(exc).__name__}: "
+                f"{sanitize_persisted_text(str(exc))[:1_000]}"
+            )
             failed = preliminary_result.model_copy(
                 update={
                     "outcome": Outcome.CONTINUE_RESEARCH,
-                    "residual_risks": [
-                        *preliminary_result.residual_risks,
-                        (
-                            "Revision-bound validation failed: "
-                            f"{type(exc).__name__}: "
-                            f"{sanitize_persisted_text(str(exc))[:1_000]}"
-                        ),
-                    ],
                 }
+            )
+            failed = _validated_result_with_residual_risks(
+                failed,
+                add=(validation_failure_risk,),
+                retain=(
+                    *_checkpoint_invariant_risks(preliminary_result),
+                    validation_failure_risk,
+                ),
             )
             state = HaloState(
                 issue_repository=issue.repository,
@@ -933,8 +991,26 @@ class HaloService:
                 persisted_base_revision=workspace.base_revision,
                 expected_snapshot=snapshot,
             )
+            synthesis_failure_risk = (
+                "Final candidate synthesis failed closed: "
+                f"{type(exc).__name__}: "
+                f"{sanitize_persisted_text(str(exc))[:1_000]}"
+            )
+            failure_retained_risks: tuple[str, ...] = ()
+            failure_risks = [synthesis_failure_risk]
+            if preliminary_result.turn_budget_exhausted:
+                failure_retained_risks = (
+                    *_checkpoint_invariant_risks(preliminary_result),
+                    synthesis_failure_risk,
+                )
+                failure_risks = [
+                    *preliminary_result.residual_risks,
+                    synthesis_failure_risk,
+                    _TURN_BUDGET_CHECKPOINT_RISK,
+                ]
             failed = InvestigationResult(
                 outcome=Outcome.CONTINUE_RESEARCH,
+                turn_budget_exhausted=preliminary_result.turn_budget_exhausted,
                 summary=(
                     "The exact candidate evidence was collected, but its final "
                     "read-only synthesis did not complete."
@@ -949,13 +1025,10 @@ class HaloService:
                     *validation_actions,
                 ],
                 verification=verification,
-                residual_risks=[
-                    (
-                        "Final candidate synthesis failed closed: "
-                        f"{type(exc).__name__}: "
-                        f"{sanitize_persisted_text(str(exc))[:1_000]}"
-                    )
-                ],
+                residual_risks=_bounded_residual_risks(
+                    failure_risks,
+                    retain=failure_retained_risks,
+                ),
             )
             self._append(
                 github,
@@ -988,6 +1061,7 @@ class HaloService:
             return
         result = InvestigationResult(
             outcome=decision.outcome,
+            turn_budget_exhausted=preliminary_result.turn_budget_exhausted,
             summary=decision.summary,
             evidence=decision.evidence,
             analysis_sha256=analysis_sha256,
@@ -1017,38 +1091,88 @@ class HaloService:
                 )
             }
         )
+        retained_result_risks: tuple[str, ...] = ()
+        if preliminary_result.turn_budget_exhausted:
+            retained_result_risks = (
+                *_checkpoint_invariant_risks(preliminary_result),
+                *result.residual_risks,
+            )
+            result = result.model_copy(
+                update={
+                    "outcome": Outcome.CONTINUE_RESEARCH,
+                    "turn_budget_exhausted": True,
+                    "summary": preliminary_result.summary,
+                    "todo_handoff": None,
+                    "blocker": None,
+                    "blocker_verified": False,
+                    "residual_risks": _bounded_residual_risks(
+                        (
+                            *preliminary_result.residual_risks,
+                            *result.residual_risks,
+                            _TURN_BUDGET_CHECKPOINT_RISK,
+                        ),
+                        retain=retained_result_risks,
+                    ),
+                }
+            )
         if not source_clean:
+            source_mutation_risk = (
+                "A candidate-validation command changed repository source "
+                "after publication; Halo discarded that unrecorded change."
+            )
+            retained_result_risks = (
+                *retained_result_risks,
+                source_mutation_risk,
+            )
             result = result.model_copy(
                 update={
                     "outcome": Outcome.CONTINUE_RESEARCH,
                     "residual_risks": [
                         *result.residual_risks,
-                        (
-                            "A candidate-validation command changed repository source "
-                            "after publication; Halo discarded that unrecorded change."
-                        ),
+                        source_mutation_risk,
                     ],
                 }
             )
         current_base_revision = manager.current_base_revision()
         if current_base_revision != workspace.base_revision:
+            prior_risks = set(result.residual_risks)
             result = self._base_revision_drift_result(
                 result,
                 persisted_revision=workspace.base_revision,
                 current_revision=current_base_revision,
             )
+            retained_result_risks = (
+                *retained_result_risks,
+                *(risk for risk in result.residual_risks if risk not in prior_risks),
+            )
+        prior_risks = set(result.residual_risks)
         result = self._gate_outcome(result)
+        retained_result_risks = (
+            *retained_result_risks,
+            *(risk for risk in result.residual_risks if risk not in prior_risks),
+        )
         if result.outcome == Outcome.READY_FOR_TODO and result.changed_paths and snapshot is None:
+            unpublished_snapshot_risk = (
+                "A code-ready handoff requires a published experimental snapshot."
+            )
+            retained_result_risks = (
+                *retained_result_risks,
+                unpublished_snapshot_risk,
+            )
             result = result.model_copy(
                 update={
                     "outcome": Outcome.CONTINUE_RESEARCH,
                     "residual_risks": [
                         *result.residual_risks,
-                        "A code-ready handoff requires a published experimental snapshot.",
+                        unpublished_snapshot_risk,
                     ],
                 }
             )
 
+        result = _validated_result_with_residual_risks(
+            result,
+            retain=retained_result_risks,
+        )
         phase, _, _ = self._route(config, result)
         state = HaloState(
             issue_repository=issue.repository,

@@ -775,6 +775,7 @@ class _FakeInvestigator:
         self.synthesis_calls = 0
         self.synthesis_error: Exception | None = None
         self.synthesis_outcome: Outcome | None = None
+        self.synthesis_residual_risks: list[str] | None = None
 
     async def run(self, **_kwargs: object) -> InvestigationResult:
         self.calls += 1
@@ -819,7 +820,11 @@ class _FakeInvestigator:
             evidence=evidence,
             competing_hypotheses=preliminary.competing_hypotheses,
             experiments=preliminary.experiments,
-            residual_risks=preliminary.residual_risks,
+            residual_risks=(
+                self.synthesis_residual_risks
+                if self.synthesis_residual_risks is not None
+                else preliminary.residual_risks
+            ),
             todo_handoff=(preliminary.todo_handoff if outcome == Outcome.READY_FOR_TODO else None),
             blocker=preliminary.blocker,
         )
@@ -1764,8 +1769,15 @@ async def test_validating_reentry_uses_the_original_persisted_observation_baseli
             _workspace: HaloWorkspace,
             *,
             expected_snapshot: BranchSnapshot | None,
-        ) -> None:
+        ) -> PublicationIntent | None:
             assert expected_snapshot is not None
+            return None
+
+        @staticmethod
+        def discard_unpublished_attempt(
+            _workspace: HaloWorkspace,
+            **_kwargs: object,
+        ) -> None:
             return None
 
     class Engine:
@@ -1833,6 +1845,68 @@ async def test_validating_reentry_uses_the_original_persisted_observation_baseli
         )
     )
     finished.clear()
+    investigator.synthesis_outcome = Outcome.READY_FOR_TODO
+    investigator.synthesis_residual_risks = [f"synthesis risk {index}" for index in range(8)]
+    turn_limit_risk = (
+        "The investigator reached its configured 100-turn limit. "
+        "The experimental checkpoint may be incomplete."
+    )
+    exhausted_preliminary = preliminary.model_copy(
+        update={
+            "outcome": Outcome.CONTINUE_RESEARCH,
+            "turn_budget_exhausted": True,
+            "summary": ("The bounded investigator turn budget ended after local exploration."),
+            "residual_risks": [
+                turn_limit_risk,
+                *[f"preliminary risk {index}" for index in range(11)],
+            ],
+            "todo_handoff": None,
+        }
+    )
+
+    await service._validate_candidate(
+        config=config,
+        github=cast(GitHubClient, _FakeGitHub([])),
+        metadata=_metadata(),
+        issue=issue,
+        producer="halo-bot",
+        head=head,
+        manager=cast(WorkspaceManager, Manager()),
+        workspace=workspace,
+        workspace_branch=workspace.branch,
+        run_id=validating_state.run_id,
+        snapshot=validating_state.branch,
+        preliminary_result=exhausted_preliminary,
+        discussion="[]",
+    )
+
+    assert len(finished) == 1
+    checkpoint_result = finished[0].result
+    assert checkpoint_result is not None
+    assert checkpoint_result.outcome == Outcome.CONTINUE_RESEARCH
+    assert checkpoint_result.turn_budget_exhausted is True
+    assert checkpoint_result.summary == exhausted_preliminary.summary
+    assert checkpoint_result.todo_handoff is None
+    assert checkpoint_result.blocker is None
+    assert checkpoint_result.blocker_verified is False
+    assert turn_limit_risk in checkpoint_result.residual_risks
+    assert "synthesis risk 0" in checkpoint_result.residual_risks
+    assert len(checkpoint_result.residual_risks) == 12
+    assert any(
+        risk.startswith("The preliminary investigator exhausted")
+        for risk in checkpoint_result.residual_risks
+    )
+    assert InvestigationResult.model_validate(checkpoint_result.model_dump()) == checkpoint_result
+
+    checkpoints = iter(
+        (
+            ObservationCheckpoint(),
+            checkpoint,
+            checkpoint,
+        )
+    )
+    finished.clear()
+    investigator.synthesis_residual_risks = None
     investigator.synthesis_error = RuntimeError("structured synthesis unavailable")
     failed_github = _FakeGitHub(
         [
@@ -1857,7 +1931,7 @@ async def test_validating_reentry_uses_the_original_persisted_observation_baseli
         workspace_branch=workspace.branch,
         run_id=validating_state.run_id,
         snapshot=validating_state.branch,
-        preliminary_result=preliminary,
+        preliminary_result=exhausted_preliminary,
         discussion="[]",
     )
 
@@ -1873,10 +1947,194 @@ async def test_validating_reentry_uses_the_original_persisted_observation_baseli
     assert failed_head.entry.state.input_fingerprint is None
     assert failed_head.entry.state.result is not None
     assert failed_head.entry.state.result.outcome == Outcome.CONTINUE_RESEARCH
+    assert failed_head.entry.state.result.turn_budget_exhausted is True
     assert failed_head.entry.state.result.summary.startswith(
         "The exact candidate evidence was collected"
     )
     assert failed_head.entry.state.result.todo_handoff is None
+    assert turn_limit_risk in failed_head.entry.state.result.residual_risks
+    assert any(
+        "structured synthesis unavailable" in risk
+        for risk in failed_head.entry.state.result.residual_risks
+    )
+    assert len(failed_head.entry.state.result.residual_risks) == 12
+    assert (
+        InvestigationResult.model_validate(failed_head.entry.state.result.model_dump())
+        == failed_head.entry.state.result
+    )
+
+    def fail_validation_stage(
+        _config: HaloConfig,
+        _workspace: Path,
+        **_kwargs: object,
+    ) -> list[ExecutedAction]:
+        raise RuntimeError("candidate validation exploded")
+
+    monkeypatch.setattr(
+        "shea_halo.service.run_configured_stage",
+        fail_validation_stage,
+    )
+    monkeypatch.setattr(
+        "shea_halo.service.discard_worktree_observation_changes",
+        lambda *_args, **_kwargs: (),
+    )
+    validation_failure_github = _FakeGitHub(
+        [
+            IssueComment(
+                database_id=head.comment_id,
+                author="halo-bot",
+                body=render_entry(head.entry, "Validating candidate."),
+                created_at="2026-07-24T00:00:00Z",
+            )
+        ]
+    )
+
+    await service._validate_candidate(
+        config=config,
+        github=cast(GitHubClient, validation_failure_github),
+        metadata=_metadata(),
+        issue=issue,
+        producer="halo-bot",
+        head=head,
+        manager=cast(WorkspaceManager, Manager()),
+        workspace=workspace,
+        workspace_branch=workspace.branch,
+        run_id=validating_state.run_id,
+        snapshot=validating_state.branch,
+        preliminary_result=exhausted_preliminary,
+        discussion="[]",
+    )
+
+    validation_failure_head = find_head(
+        validation_failure_github.comments,
+        repository=config.repository,
+        issue_number=issue.number,
+        trusted_producers={"halo-bot"},
+    )
+    assert validation_failure_head is not None
+    validation_failure_result = validation_failure_head.entry.state.result
+    assert validation_failure_result is not None
+    assert validation_failure_result.turn_budget_exhausted is True
+    assert turn_limit_risk in validation_failure_result.residual_risks
+    assert any(
+        "candidate validation exploded" in risk for risk in validation_failure_result.residual_risks
+    )
+    assert len(validation_failure_result.residual_risks) == 12
+    assert (
+        InvestigationResult.model_validate(validation_failure_result.model_dump())
+        == validation_failure_result
+    )
+
+    def fail_observation_cleanup(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        raise PermissionError("observation cleanup denied")
+
+    monkeypatch.setattr(
+        "shea_halo.service.discard_worktree_observation_changes",
+        fail_observation_cleanup,
+    )
+    finished.clear()
+
+    await service._validate_candidate(
+        config=config,
+        github=cast(GitHubClient, _FakeGitHub([])),
+        metadata=_metadata(),
+        issue=issue,
+        producer="halo-bot",
+        head=head,
+        manager=cast(WorkspaceManager, Manager()),
+        workspace=workspace,
+        workspace_branch=workspace.branch,
+        run_id=validating_state.run_id,
+        snapshot=validating_state.branch,
+        preliminary_result=exhausted_preliminary,
+        discussion="[]",
+    )
+
+    assert len(finished) == 1
+    cleanup_failure_result = finished[0].result
+    assert cleanup_failure_result is not None
+    assert cleanup_failure_result.outcome == Outcome.BLOCKED
+    assert cleanup_failure_result.turn_budget_exhausted is True
+    assert turn_limit_risk in cleanup_failure_result.residual_risks
+    assert any(
+        "observation cleanup denied" in risk for risk in cleanup_failure_result.residual_risks
+    )
+    assert len(cleanup_failure_result.residual_risks) == 12
+    assert (
+        InvestigationResult.model_validate(cleanup_failure_result.model_dump())
+        == cleanup_failure_result
+    )
+
+    class SourceMutationAndDriftManager(Manager):
+        @staticmethod
+        def create_publication_intent(
+            _workspace: HaloWorkspace,
+            *,
+            expected_snapshot: BranchSnapshot | None,
+        ) -> PublicationIntent:
+            assert expected_snapshot is not None
+            return PublicationIntent(
+                branch=expected_snapshot.name,
+                parent_revision=expected_snapshot.head_revision,
+                manifest_sha256="f" * 64,
+                paths=[
+                    SnapshotPath(
+                        path="unexpected-source-change.txt",
+                        state="deleted",
+                    )
+                ],
+            )
+
+        @staticmethod
+        def current_base_revision() -> str:
+            return "f" * 40
+
+    checkpoints = iter(
+        (
+            ObservationCheckpoint(),
+            checkpoint,
+            checkpoint,
+        )
+    )
+    monkeypatch.setattr("shea_halo.service.run_configured_stage", stage)
+    monkeypatch.setattr(
+        "shea_halo.service.discard_worktree_observation_changes",
+        lambda *_args, **_kwargs: (),
+    )
+    investigator.synthesis_error = None
+    investigator.synthesis_outcome = Outcome.READY_FOR_TODO
+    investigator.synthesis_residual_risks = [f"synthesis risk {index}" for index in range(8)]
+    finished.clear()
+
+    await service._validate_candidate(
+        config=config,
+        github=cast(GitHubClient, _FakeGitHub([])),
+        metadata=_metadata(),
+        issue=issue,
+        producer="halo-bot",
+        head=head,
+        manager=cast(WorkspaceManager, SourceMutationAndDriftManager()),
+        workspace=workspace,
+        workspace_branch=workspace.branch,
+        run_id=validating_state.run_id,
+        snapshot=validating_state.branch,
+        preliminary_result=exhausted_preliminary,
+        discussion="[]",
+    )
+
+    assert len(finished) == 1
+    drift_result = finished[0].result
+    assert drift_result is not None
+    assert drift_result.outcome == Outcome.BLOCKED
+    assert drift_result.turn_budget_exhausted is True
+    assert turn_limit_risk in drift_result.residual_risks
+    assert any(
+        "changed repository source after publication" in risk
+        for risk in drift_result.residual_risks
+    )
+    assert any("f" * 40 in risk for risk in drift_result.residual_risks)
+    assert len(drift_result.residual_risks) == 12
+    assert InvestigationResult.model_validate(drift_result.model_dump()) == drift_result
 
 
 async def test_lock_conflict_skips_target_and_leaves_project_untouched(
