@@ -37,6 +37,19 @@ def _positive_int(data: dict[str, Any], name: str) -> int:
     return value
 
 
+def _bounded_positive_int(
+    data: dict[str, Any],
+    name: str,
+    *,
+    default: int,
+    maximum: int,
+) -> int:
+    value = data.get(name, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0 or value > maximum:
+        raise ConfigError(f"{name} must be an integer from 1 to {maximum}")
+    return value
+
+
 def _boolean(data: dict[str, Any], name: str, default: bool) -> bool:
     value = data.get(name, default)
     if not isinstance(value, bool):
@@ -194,6 +207,7 @@ class HaloConfig:
     artifacts_dir: Path
     worktrees_dir: Path
     model: str
+    investigator_max_turns: int
     halo_model: str
 
     @classmethod
@@ -289,5 +303,11 @@ class HaloConfig:
                 root, _string(runtime, "worktrees", ".shea/worktrees/halo")
             ),
             model=_string(models, "investigator", os.getenv("OPENAI_MODEL", "gpt-5.6")),
+            investigator_max_turns=_bounded_positive_int(
+                models,
+                "investigator_max_turns",
+                default=30,
+                maximum=100,
+            ),
             halo_model=_string(models, "halo", os.getenv("HALO_MODEL", "gpt-5.6")),
         )

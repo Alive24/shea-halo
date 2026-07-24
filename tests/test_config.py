@@ -24,6 +24,7 @@ def test_loads_minimal_target_config(tmp_path: Path) -> None:
     assert config.external_blocker_exit_codes == frozenset()
     assert config.target_environment_variables == ()
     assert config.verification_commands == (("python", "-m", "pytest"),)
+    assert config.investigator_max_turns == 30
 
 
 @pytest.mark.parametrize(
@@ -278,6 +279,45 @@ def test_shared_config_cannot_request_host_credentials(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ConfigError, match="only in ignored halo.local.toml"):
+        HaloConfig.load(tmp_path)
+
+
+def test_investigator_turn_budget_can_be_increased_within_bound(tmp_path: Path) -> None:
+    write_target_config(tmp_path)
+    path = tmp_path / ".shea/halo.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8") + "\n[models]\ninvestigator_max_turns = 60\n",
+        encoding="utf-8",
+    )
+
+    assert HaloConfig.load(tmp_path).investigator_max_turns == 60
+
+
+@pytest.mark.parametrize("value", [1, 100])
+def test_investigator_turn_budget_accepts_closed_interval_boundaries(
+    tmp_path: Path,
+    value: int,
+) -> None:
+    write_target_config(tmp_path)
+    path = tmp_path / ".shea/halo.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8") + f"\n[models]\ninvestigator_max_turns = {value}\n",
+        encoding="utf-8",
+    )
+
+    assert HaloConfig.load(tmp_path).investigator_max_turns == value
+
+
+@pytest.mark.parametrize("value", ["0", "101", "true", "1.5", '"60"'])
+def test_investigator_turn_budget_is_bounded(tmp_path: Path, value: str) -> None:
+    write_target_config(tmp_path)
+    path = tmp_path / ".shea/halo.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8") + f"\n[models]\ninvestigator_max_turns = {value}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="investigator_max_turns"):
         HaloConfig.load(tmp_path)
 
 

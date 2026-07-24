@@ -565,7 +565,7 @@ class Investigator:
                 result = await Runner.run(
                     agent,
                     prompt,
-                    max_turns=30,
+                    max_turns=config.investigator_max_turns,
                     run_config=RunConfig(tracing_disabled=True),
                 )
                 decision = result.final_output

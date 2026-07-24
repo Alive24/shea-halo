@@ -47,6 +47,7 @@ from shea_halo.observation import (
     TraceObservation,
     TraceValidation,
 )
+from shea_halo.workspace import HaloWorkspace
 
 
 def test_agent_can_only_select_exact_operator_configured_actions(tmp_path: Path) -> None:
@@ -58,6 +59,70 @@ def test_agent_can_only_select_exact_operator_configured_actions(tmp_path: Path)
         ("experiment", ("python", "-m", "pytest")),
         ("verification", ("python", "-m", "pytest")),
     )
+
+
+async def test_investigator_uses_configured_turn_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_target_config(tmp_path)
+    config = replace(HaloConfig.load(tmp_path), investigator_max_turns=60)
+    workspace = HaloWorkspace(
+        path=tmp_path,
+        branch="halo/issue-26-improve-tracing",
+        base_revision="1" * 40,
+    )
+    captured: dict[str, object] = {}
+    decision = AgentDecision(
+        outcome=Outcome.CONTINUE_RESEARCH,
+        summary="More evidence is needed.",
+    )
+
+    class Span:
+        def __enter__(self) -> Span:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def set_input(self, _value: object) -> None:
+            return None
+
+        def set_output(self, _value: object) -> None:
+            return None
+
+        def set_attribute(self, _name: str, _value: object) -> None:
+            return None
+
+    async def run(_agent: object, _prompt: str, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(final_output=decision)
+
+    monkeypatch.setattr("shea_halo.agent.IntegrationCatalog.load", lambda _self: [])
+    monkeypatch.setattr("shea_halo.agent.discover_dependencies", lambda _path: {})
+    monkeypatch.setattr("shea_halo.agent.rank_guides", lambda _guides, _dependencies: [])
+    monkeypatch.setattr("shea_halo.agent.load_desktop_reports", lambda _config: "")
+    monkeypatch.setattr("shea_halo.agent._changed_paths", lambda _path: [])
+    monkeypatch.setattr(
+        "shea_halo.agent.setup",
+        lambda **_kwargs: SimpleNamespace(tracer=object(), shutdown=lambda: None),
+    )
+    monkeypatch.setattr("shea_halo.agent.agent_span", lambda *_args, **_kwargs: Span())
+    monkeypatch.setattr("shea_halo.agent.Runner.run", run)
+
+    await Investigator().run(
+        config=config,
+        workspace=workspace,
+        run_id="halo-26-turn-budget",
+        issue_number=26,
+        issue_title="Improve tracing",
+        issue_body="Investigate the harness.",
+        issue_discussion="[]",
+        prior_result=None,
+        halo_analysis=None,
+    )
+
+    assert captured["max_turns"] == 60
 
 
 def test_canonical_trace_guidance_comes_from_the_installed_public_engine_model() -> None:

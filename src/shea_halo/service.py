@@ -1487,6 +1487,7 @@ class HaloService:
                 "external_blocker_exit_codes": sorted(config.external_blocker_exit_codes),
                 "verification_commands": config.verification_commands,
                 "model": config.model,
+                "investigator_max_turns": config.investigator_max_turns,
                 "halo_model": config.halo_model,
             },
         }

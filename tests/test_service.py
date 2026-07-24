@@ -496,11 +496,19 @@ def test_reentry_input_fingerprint_is_stable_and_tracks_new_discussion(
         checkpoint=checkpoint,
         branch=branch,
     )
+    with_larger_turn_budget = HaloService._input_fingerprint(
+        config=replace(config, investigator_max_turns=60),
+        issue=issue,
+        discussion="[]",
+        checkpoint=checkpoint,
+        branch=branch,
+    )
 
     assert first == same
     assert first != changed
     assert first != with_runtime_handle
     assert with_runtime_handle != with_endpoint_override
+    assert with_endpoint_override != with_larger_turn_budget
 
 
 def test_discussion_context_ignores_workpad_and_sanitizes_public_input() -> None:

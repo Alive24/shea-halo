@@ -167,7 +167,7 @@ A framework-neutral Issue starting point is at [`examples/halo-research-issue.md
 
 Optional `[runtime]` paths default to `.shea/logs/halo`, `.shea/artifacts/halo`, and `.shea/worktrees/halo`. Runtime paths must remain below the target's `.shea/` directory and cannot escape through symlinks.
 
-Optional `[models]` keys `investigator` and `halo` default to `OPENAI_MODEL`, `HALO_MODEL`, then `gpt-5.6`.
+Optional `[models]` keys `investigator` and `halo` default to `OPENAI_MODEL`, `HALO_MODEL`, then `gpt-5.6`. `investigator_max_turns` defaults to `30` and may be set from `1` through `100`; increase it only when a repository-scale experiment genuinely needs more tool iterations. The budget participates in re-entry fingerprinting, so changing it makes a failed research attempt immediately eligible for another pass.
 
 For machine-local onboarding, a complete ignored `.shea/halo.local.toml` takes precedence over the shared file. It is a full replacement, so the effective contract always has one unambiguous source.
 
