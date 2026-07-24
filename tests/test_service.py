@@ -39,7 +39,7 @@ from shea_halo.observation import (
     TraceValidation,
 )
 from shea_halo.runtime_fs import RuntimeFilesystemError
-from shea_halo.service import HaloService, ServiceError
+from shea_halo.service import HaloService, ServiceError, _runtime_source_sha256
 from shea_halo.workpad import WorkpadHead, find_head, next_entry, render_entry
 from shea_halo.workspace import HaloWorkspace, WorkspaceManager
 
@@ -144,7 +144,24 @@ def test_routes_only_completed_research_to_symphony_todo(tmp_path: Path) -> None
     )
 
     assert ready[:2] == ("ready", "Todo")
-    assert continuing[:2] == ("experimenting", None)
+    assert continuing[:2] == ("research", None)
+
+
+def test_runtime_source_digest_is_stable_and_tracks_code_changes(tmp_path: Path) -> None:
+    package = tmp_path / "shea_halo"
+    nested = package / "nested"
+    nested.mkdir(parents=True)
+    first = package / "first.py"
+    second = nested / "second.py"
+    first.write_text("FIRST = 1\n", encoding="utf-8")
+    second.write_text("SECOND = 2\n", encoding="utf-8")
+
+    initial = _runtime_source_sha256(package)
+    assert initial == _runtime_source_sha256(package)
+
+    second.write_text("SECOND = 3\n", encoding="utf-8")
+
+    assert initial != _runtime_source_sha256(package)
 
 
 def test_halo_state_rejects_incoherent_lifecycle_payloads() -> None:
@@ -440,6 +457,7 @@ def test_reentry_input_fingerprint_is_stable_and_tracks_new_discussion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("shea_halo.service._RUNTIME_SOURCE_SHA256", "a" * 64)
     monkeypatch.delenv("PROVIDER_RUNTIME_HANDLE", raising=False)
     monkeypatch.delenv("CATALYST_OTLP_ENDPOINT", raising=False)
     write_target_config(tmp_path)
@@ -503,12 +521,21 @@ def test_reentry_input_fingerprint_is_stable_and_tracks_new_discussion(
         checkpoint=checkpoint,
         branch=branch,
     )
+    monkeypatch.setattr("shea_halo.service._RUNTIME_SOURCE_SHA256", "b" * 64)
+    with_updated_runtime = HaloService._input_fingerprint(
+        config=config,
+        issue=issue,
+        discussion="[]",
+        checkpoint=checkpoint,
+        branch=branch,
+    )
 
     assert first == same
     assert first != changed
     assert first != with_runtime_handle
     assert with_runtime_handle != with_endpoint_override
     assert with_endpoint_override != with_larger_turn_budget
+    assert with_endpoint_override != with_updated_runtime
 
 
 def test_discussion_context_ignores_workpad_and_sanitizes_public_input() -> None:
@@ -1842,7 +1869,7 @@ async def test_validating_reentry_uses_the_original_persisted_observation_baseli
         trusted_producers={"halo-bot"},
     )
     assert failed_head is not None
-    assert failed_head.entry.state.phase == "experimenting"
+    assert failed_head.entry.state.phase == "research"
     assert failed_head.entry.state.input_fingerprint is None
     assert failed_head.entry.state.result is not None
     assert failed_head.entry.state.result.outcome == Outcome.CONTINUE_RESEARCH

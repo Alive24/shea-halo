@@ -29,7 +29,7 @@ Halo Research
 
 Every workpad entry links to its predecessor, shows a human-readable summary first, and puts canonical JSON in a folded block. Shea Halo never edits an Issue body or existing comment. Marker-like comments from untrusted authors are ordinary discussion, while an edited trusted workpad comment fails closed.
 
-On re-entry, Halo reads the prior trusted workpad result plus ordinary Issue discussion. It fingerprints the Issue, discussion, observation artifacts, branch snapshot, and effective experiment contract, so an unchanged incomplete item is not rerun every polling interval. The runtime part records only allowlisted environment-variable names and whether each is present, plus the normalized effective OTLP endpoint—never credential values. New comments, new trace/Desktop artifacts, code or configuration changes, runtime capability becoming available, and a daily documentation refresh reopen the loop.
+On re-entry, Halo reads the prior trusted workpad result plus ordinary Issue discussion. It fingerprints the Issue, discussion, observation artifacts, branch snapshot, effective experiment contract, and the Shea Halo runtime source loaded at worker startup, so an unchanged incomplete item is not rerun every polling interval. The environment part records only allowlisted environment-variable names and whether each is present, plus the normalized effective OTLP endpoint—never credential values. New comments, new trace/Desktop artifacts, target code or configuration changes, a Shea Halo runtime update, runtime capability becoming available, and a daily documentation refresh reopen the loop.
 
 Terminal routing is also append-only. Halo records a pending status transition, changes the Project field, then records the applied transition. If the status write succeeds but the second comment fails, the worker scans every status for Issues in the configured target repository on its next pass. It either completes that workpad record or records that a later downstream status such as `In Progress` superseded the pending Halo transition; it never moves the item backward.
 
@@ -194,7 +194,8 @@ Shea Halo is a long-running local worker because experiments need the target's r
 - `SHEA_HALO_TARGETS`: local target checkout roots separated by the platform path separator;
 - `OPENAI_API_KEY`: used by OpenAI Agents SDK and HALO Engine;
 - GitHub authentication through `gh` or `GH_TOKEN`, with repository and Project access;
-- optional `CATALYST_OTLP_ENDPOINT`, `CATALYST_OTLP_TOKEN`, and `CATALYST_SERVICE_NAME`.
+- optional `CATALYST_OTLP_ENDPOINT`, `CATALYST_OTLP_TOKEN`, and `CATALYST_SERVICE_NAME`;
+- optional `DENO_DIR`: a persistent writable Deno cache for restricted launchers that cannot write Deno's normal user cache.
 
 If `CATALYST_OTLP_ENDPOINT` is absent, the configured Catalyst SDK base endpoint is used. Credentials are runtime configuration and are never written to target config, artifacts, workpads, or branches.
 

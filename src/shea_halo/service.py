@@ -53,6 +53,27 @@ class ServiceError(RuntimeError):
     pass
 
 
+def _runtime_source_sha256(package_root: Path | None = None) -> str:
+    """Identify the runtime code loaded by a newly started worker."""
+
+    root = package_root or Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    sources = sorted(path for path in root.rglob("*.py") if path.is_file())
+    if not sources:
+        raise ServiceError("Shea Halo runtime contains no Python source files")
+    for source in sources:
+        relative = source.relative_to(root).as_posix().encode("utf-8")
+        content = source.read_bytes()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+_RUNTIME_SOURCE_SHA256 = _runtime_source_sha256()
+
+
 class HaloService:
     def __init__(
         self,
@@ -456,7 +477,7 @@ class HaloService:
                 issue_repository=issue.repository,
                 issue_number=issue.number,
                 run_id=run_id,
-                phase="experimenting",
+                phase="research",
                 workspace_branch=workspace_branch,
                 base_revision=workspace.base_revision,
                 branch=head.entry.state.branch,
@@ -796,7 +817,7 @@ class HaloService:
                 issue_repository=issue.repository,
                 issue_number=issue.number,
                 run_id=run_id,
-                phase="experimenting",
+                phase="research",
                 workspace_branch=workspace_branch,
                 base_revision=workspace.base_revision,
                 branch=snapshot,
@@ -945,7 +966,7 @@ class HaloService:
                     issue_repository=issue.repository,
                     issue_number=issue.number,
                     run_id=run_id,
-                    phase="experimenting",
+                    phase="research",
                     workspace_branch=workspace_branch,
                     base_revision=workspace.base_revision,
                     branch=snapshot,
@@ -1474,6 +1495,9 @@ class HaloService:
             },
             "observation": checkpoint.model_dump(mode="json"),
             "branch": branch_payload,
+            "runtime": {
+                "shea_halo_source_sha256": _RUNTIME_SOURCE_SHA256,
+            },
             "configuration": {
                 "repository": config.repository,
                 "base_branch": config.base_branch,
@@ -1527,7 +1551,7 @@ class HaloService:
                 "A genuine external dependency requires human input before research can continue.",
             )
         return (
-            "experimenting",
+            "research",
             None,
             "Evidence or verification remains incomplete; the item stays in Halo Research.",
         )
