@@ -4,7 +4,14 @@ import pytest
 
 from shea_halo.github import IssueComment
 from shea_halo.models import BranchSnapshot, Evidence, HaloState, InvestigationResult, Outcome
-from shea_halo.workpad import WorkpadError, find_head, next_entry, render_entry
+from shea_halo.workpad import (
+    MARKER,
+    WorkpadError,
+    find_head,
+    next_entry,
+    render_entry,
+    trusted_workpad_comment_ids,
+)
 
 
 def state(phase: str = "research") -> HaloState:
@@ -104,6 +111,70 @@ def test_workpad_ignores_self_consistent_untrusted_producer() -> None:
         )
         is None
     )
+
+
+def test_trusted_workpad_comment_ids_excludes_untrusted_marker_discussion() -> None:
+    first = next_entry(state(), None, producer="halo-bot")
+    first_comment = comment(101, render_entry(first, "Started."))
+    first_head = find_head(
+        [first_comment],
+        repository="Alive24/FailureReport",
+        issue_number=20,
+        trusted_producers={"halo-bot"},
+    )
+    assert first_head is not None
+    second = next_entry(state("experimenting"), first_head, producer="halo-bot")
+    untrusted_marker = comment(
+        103,
+        f"{MARKER}\n\nThis is ordinary human discussion, not state.",
+        author="reader",
+    )
+
+    trusted_ids = trusted_workpad_comment_ids(
+        [
+            first_comment,
+            comment(102, render_entry(second, "Experimenting.")),
+            untrusted_marker,
+        ],
+        repository="Alive24/FailureReport",
+        issue_number=20,
+        trusted_producers={"halo-bot"},
+    )
+
+    assert trusted_ids == frozenset({101, 102})
+    assert untrusted_marker.database_id not in trusted_ids
+
+
+def test_trusted_workpad_comment_ids_fails_closed_on_malformed_trusted_comment() -> None:
+    malformed = comment(101, f"{MARKER}\n\nMissing structured state.")
+
+    with pytest.raises(WorkpadError, match="malformed"):
+        trusted_workpad_comment_ids(
+            [malformed],
+            repository="Alive24/FailureReport",
+            issue_number=20,
+            trusted_producers={"halo-bot"},
+        )
+
+
+def test_trusted_workpad_comment_ids_fails_closed_on_edited_trusted_comment() -> None:
+    entry = next_entry(state(), None, producer="halo-bot")
+    original = comment(101, render_entry(entry, "Started."))
+    edited = IssueComment(
+        database_id=original.database_id,
+        author=original.author,
+        body=original.body,
+        created_at=original.created_at,
+        updated_at="2026-07-24T00:01:00Z",
+    )
+
+    with pytest.raises(WorkpadError, match="edited after creation"):
+        trusted_workpad_comment_ids(
+            [edited],
+            repository="Alive24/FailureReport",
+            issue_number=20,
+            trusted_producers={"halo-bot"},
+        )
 
 
 def test_workpad_rejects_an_edited_trusted_comment() -> None:

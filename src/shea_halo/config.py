@@ -6,6 +6,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 class ConfigError(ValueError):
@@ -36,6 +37,13 @@ def _positive_int(data: dict[str, Any], name: str) -> int:
     return value
 
 
+def _boolean(data: dict[str, Any], name: str, default: bool) -> bool:
+    value = data.get(name, default)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{name} must be a boolean")
+    return value
+
+
 def _managed_runtime_path(root: Path, raw: str) -> Path:
     candidate = Path(raw)
     if candidate.is_absolute() or ".." in candidate.parts:
@@ -55,6 +63,52 @@ def _relative_glob(raw: str) -> str:
     if candidate.is_absolute() or ".." in candidate.parts:
         raise ConfigError(f"observation glob must stay under the target repository: {raw}")
     return raw
+
+
+def validate_catalyst_sdk_base_endpoint(value: str) -> str:
+    name = "catalyst_sdk_base_endpoint"
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"observation.{name} must be an HTTP(S) base URL")
+    if value != value.strip() or any(character.isspace() for character in value):
+        raise ConfigError(f"observation.{name} must be an HTTP(S) base URL")
+
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ConfigError(f"observation.{name} must be an HTTP(S) base URL")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ConfigError(f"observation.{name} must be an HTTP(S) base URL") from exc
+
+    normalized_path = parsed.path.rstrip("/")
+    if normalized_path.endswith("/v1/traces"):
+        base_path = normalized_path[: -len("/v1/traces")]
+        return parsed._replace(path=base_path).geturl()
+    if re.search(r"(?:^|/)v1/traces(?:/|$)", parsed.path):
+        raise ConfigError(
+            f"observation.{name} may end with /v1/traces but cannot contain content after it"
+        )
+    return value
+
+
+def _catalyst_sdk_base_endpoint(data: dict[str, Any]) -> str:
+    legacy_name = "desktop_otlp_base_endpoint"
+    if legacy_name in data:
+        raise ConfigError(
+            "observation.desktop_otlp_base_endpoint is not supported; "
+            "use observation.catalyst_sdk_base_endpoint"
+        )
+    return validate_catalyst_sdk_base_endpoint(
+        _string(data, "catalyst_sdk_base_endpoint", "http://127.0.0.1:8799")
+    )
 
 
 def _commands(data: dict[str, Any], table_name: str) -> tuple[tuple[str, ...], ...]:
@@ -80,6 +134,18 @@ def _environment_names(data: dict[str, Any], table_name: str) -> tuple[str, ...]
     ):
         raise ConfigError(f"{table_name}.pass_env must be a list of environment names")
     return tuple(sorted(set(raw_names)))
+
+
+def _external_blocker_exit_codes(data: dict[str, Any]) -> frozenset[int]:
+    raw_codes = data.get("external_blocker_exit_codes", [])
+    if not isinstance(raw_codes, list) or not all(
+        isinstance(code, int) and not isinstance(code, bool) and 1 <= code <= 255
+        for code in raw_codes
+    ):
+        raise ConfigError(
+            "experiments.external_blocker_exit_codes must contain integers from 1 to 255"
+        )
+    return frozenset(raw_codes)
 
 
 def _trusted_producers(data: dict[str, Any]) -> tuple[str, ...]:
@@ -108,7 +174,8 @@ class TrackerConfig:
 class ObservationConfig:
     trace_globs: tuple[str, ...]
     desktop_report_globs: tuple[str, ...]
-    desktop_otlp_base_endpoint: str
+    catalyst_sdk_base_endpoint: str
+    require_candidate_traces: bool
 
 
 @dataclass(frozen=True)
@@ -118,7 +185,9 @@ class HaloConfig:
     base_branch: str
     tracker: TrackerConfig
     observation: ObservationConfig
+    setup_commands: tuple[tuple[str, ...], ...]
     experiment_commands: tuple[tuple[str, ...], ...]
+    external_blocker_exit_codes: frozenset[int]
     target_environment_variables: tuple[str, ...]
     verification_commands: tuple[tuple[str, ...], ...]
     logs_dir: Path
@@ -148,6 +217,7 @@ class HaloConfig:
         observation = _table(data, "observation")
         if "catalog_url" in observation:
             raise ConfigError("observation.catalog_url is fixed by the Shea Halo protocol")
+        setup = _table(data, "setup")
         experiments = _table(data, "experiments")
         verification = _table(data, "verification")
         runtime = _table(data, "runtime")
@@ -173,6 +243,13 @@ class HaloConfig:
         owner_type = _string(tracker, "owner_type", "user")
         if owner_type not in {"user", "organization"}:
             raise ConfigError("tracker.owner_type must be user or organization")
+        research_state = _string(tracker, "research_state", "Halo Research")
+        ready_state = _string(tracker, "ready_state", "Todo")
+        done_state = _string(tracker, "done_state", "Done")
+        blocked_state = _string(tracker, "blocked_state", "Need Human Input")
+        status_names = (research_state, ready_state, done_state, blocked_state)
+        if len({name.casefold() for name in status_names}) != len(status_names):
+            raise ConfigError("tracker research, ready, done, and blocked states must be distinct")
 
         return cls(
             root=root,
@@ -183,22 +260,25 @@ class HaloConfig:
                 owner_type=owner_type,
                 project_number=_positive_int(tracker, "project_number"),
                 status_field=_string(tracker, "status_field", "Status"),
-                research_state=_string(tracker, "research_state", "Halo Research"),
-                ready_state=_string(tracker, "ready_state", "Todo"),
-                done_state=_string(tracker, "done_state", "Done"),
-                blocked_state=_string(tracker, "blocked_state", "Need Human Input"),
+                research_state=research_state,
+                ready_state=ready_state,
+                done_state=done_state,
+                blocked_state=blocked_state,
                 trusted_producers=_trusted_producers(tracker),
             ),
             observation=ObservationConfig(
                 trace_globs=tuple(_relative_glob(item) for item in trace_globs),
                 desktop_report_globs=tuple(_relative_glob(item) for item in desktop_report_globs),
-                desktop_otlp_base_endpoint=_string(
+                catalyst_sdk_base_endpoint=_catalyst_sdk_base_endpoint(observation),
+                require_candidate_traces=_boolean(
                     observation,
-                    "desktop_otlp_base_endpoint",
-                    "http://127.0.0.1:8799",
+                    "require_candidate_traces",
+                    True,
                 ),
             ),
+            setup_commands=_commands(setup, "setup"),
             experiment_commands=_commands(experiments, "experiments"),
+            external_blocker_exit_codes=_external_blocker_exit_codes(experiments),
             target_environment_variables=target_environment_variables,
             verification_commands=_commands(verification, "verification"),
             logs_dir=_managed_runtime_path(root, _string(runtime, "logs", ".shea/logs/halo")),

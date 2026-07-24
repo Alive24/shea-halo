@@ -33,6 +33,7 @@ class ProjectIssue:
     body: str
     url: str
     status: str
+    updated_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ _GH_ENVIRONMENT_NAMES = {
     "SYSTEMROOT",
     "XDG_CONFIG_HOME",
 }
+_GITHUB_SEARCH_RESULT_LIMIT = 1_000
 
 
 def _github_environment() -> dict[str, str]:
@@ -186,7 +188,7 @@ class GitHubClient:
                 )
         raise GitHubError(f"Project has no {self.tracker.status_field} single-select field")
 
-    def list_research_issues(self) -> list[ProjectIssue]:
+    def list_project_issues(self) -> list[ProjectIssue]:
         owner_field = "user" if self.tracker.owner_type == "user" else "organization"
         query = f"""
         query($owner:String!,$number:Int!,$after:String,$statusField:String!){{
@@ -206,6 +208,7 @@ class GitHubClient:
                       title
                       body
                       url
+                      updatedAt
                       repository{{nameWithOwner}}
                     }}
                   }}
@@ -242,11 +245,10 @@ class GitHubClient:
                     continue
                 status = node.get("fieldValueByName", {})
                 content = node.get("content")
-                if (
-                    not isinstance(status, dict)
-                    or status.get("name") != self.tracker.research_state
-                    or not isinstance(content, dict)
-                ):
+                if not isinstance(status, dict) or not isinstance(content, dict):
+                    continue
+                status_name = status.get("name")
+                if not isinstance(status_name, str) or not status_name:
                     continue
                 repository = content.get("repository", {}).get("nameWithOwner")
                 if not isinstance(repository, str):
@@ -260,7 +262,8 @@ class GitHubClient:
                         title=content["title"],
                         body=content.get("body") or "",
                         url=content["url"],
-                        status=status["name"],
+                        status=status_name,
+                        updated_at=content.get("updatedAt") or "",
                     )
                 )
             page_info = items.get("pageInfo", {})
@@ -269,6 +272,13 @@ class GitHubClient:
             cursor = page_info.get("endCursor")
             if not isinstance(cursor, str):
                 raise GitHubError("Project pagination cursor was missing")
+
+    def list_research_issues(self) -> list[ProjectIssue]:
+        return [
+            issue
+            for issue in self.list_project_issues()
+            if issue.status == self.tracker.research_state
+        ]
 
     def issue_comments(self, repository: str, number: int) -> list[IssueComment]:
         pages = self._json(
@@ -321,27 +331,19 @@ class GitHubClient:
             raise GitHubError("repository must use the owner/name form")
         if not head_branch or head_branch.strip() != head_branch:
             raise GitHubError("head branch must be a non-empty Git ref")
-        owner, name = parts
         query = """
-        query(
-          $owner:String!
-          $name:String!
-          $qualifiedName:String!
-          $after:String
-        ){
-          repository(owner:$owner,name:$name){
-            ref(qualifiedName:$qualifiedName){
-              name
-              associatedPullRequests(first:100,after:$after){
-                pageInfo{hasNextPage endCursor}
-                nodes{
-                  number
-                  url
-                  state
-                  mergedAt
-                  headRefName
-                  headRepository{nameWithOwner}
-                }
+        query($searchQuery:String!,$after:String){
+          search(type:ISSUE,query:$searchQuery,first:100,after:$after){
+            issueCount
+            pageInfo{hasNextPage endCursor}
+            nodes{
+              ... on PullRequest{
+                number
+                url
+                state
+                mergedAt
+                headRefName
+                headRepository{nameWithOwner}
               }
             }
           }
@@ -350,6 +352,8 @@ class GitHubClient:
         pull_requests: list[BranchPullRequest] = []
         seen: set[tuple[int, str]] = set()
         cursor: str | None = None
+        expected_issue_count: int | None = None
+        raw_result_count = 0
         while True:
             args = [
                 "api",
@@ -357,33 +361,27 @@ class GitHubClient:
                 "-f",
                 f"query={query}",
                 "-f",
-                f"owner={owner}",
-                "-f",
-                f"name={name}",
-                "-f",
-                f"qualifiedName=refs/heads/{head_branch}",
+                f"searchQuery=is:pr head:{head_branch}",
             ]
             if cursor is not None:
                 args.extend(["-f", f"after={cursor}"])
             data = self._json(args)
-            repository_data = data.get("data", {}).get("repository")
-            if not isinstance(repository_data, dict):
-                raise GitHubError("configured GitHub repository was not found")
-            ref = repository_data.get("ref")
-            if ref is None:
-                return BranchPullRequestCheck(
-                    repository=repository,
-                    head_branch=head_branch,
-                    pull_requests=(),
-                )
-            if not isinstance(ref, dict) or ref.get("name") != head_branch:
-                raise GitHubError("GitHub returned an unexpected head Ref")
-            connection = ref.get("associatedPullRequests")
+            connection = data.get("data", {}).get("search")
             if not isinstance(connection, dict):
-                raise GitHubError("GitHub head Ref omitted associated pull requests")
+                raise GitHubError("GitHub pull request history search was unavailable")
+            issue_count = connection.get("issueCount")
+            if not isinstance(issue_count, int) or isinstance(issue_count, bool) or issue_count < 0:
+                raise GitHubError("GitHub pull request history count was unavailable")
+            if issue_count > _GITHUB_SEARCH_RESULT_LIMIT:
+                raise GitHubError("GitHub pull request history exceeds the complete search window")
+            if expected_issue_count is None:
+                expected_issue_count = issue_count
+            elif issue_count != expected_issue_count:
+                raise GitHubError("GitHub pull request history count changed during pagination")
             nodes = connection.get("nodes")
             if not isinstance(nodes, list):
                 raise GitHubError("GitHub pull request response was not a list")
+            raw_result_count += len(nodes)
             for raw_pull_request in nodes:
                 if not isinstance(raw_pull_request, dict):
                     raise GitHubError("GitHub pull request response contained an invalid item")
@@ -399,9 +397,7 @@ class GitHubClient:
                     or head_repository.casefold() != repository.casefold()
                     or head_ref != head_branch
                 ):
-                    raise GitHubError(
-                        "GitHub returned a pull request outside the requested repository branch"
-                    )
+                    continue
                 number = raw_pull_request.get("number")
                 url = raw_pull_request.get("url")
                 state = raw_pull_request.get("state")
@@ -431,6 +427,8 @@ class GitHubClient:
             if not isinstance(page_info, dict):
                 raise GitHubError("GitHub pull request pagination was missing")
             if not page_info.get("hasNextPage"):
+                if raw_result_count != expected_issue_count:
+                    raise GitHubError("GitHub pull request history search was incomplete")
                 break
             cursor = page_info.get("endCursor")
             if not isinstance(cursor, str) or not cursor:

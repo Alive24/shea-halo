@@ -8,30 +8,45 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from shea_halo.agent import Investigator
-from shea_halo.config import HaloConfig
+from shea_halo.agent import (
+    Investigator,
+    candidate_evidence_references,
+    run_configured_stage,
+    run_verification,
+    validate_candidate_synthesis,
+)
+from shea_halo.config import HaloConfig, validate_catalyst_sdk_base_endpoint
 from shea_halo.github import GitHubClient, IssueComment, ProjectIssue, ProjectMetadata
 from shea_halo.halo_engine import HaloEngineAdapter
 from shea_halo.locking import TargetLockUnavailable, target_worker_lock
 from shea_halo.models import (
     BranchSnapshot,
+    ExecutedAction,
     ExternalBlocker,
     HaloState,
     InvestigationResult,
     Outcome,
     Phase,
+    StatusTransition,
 )
 from shea_halo.observation import (
     FileObservation,
     ObservationCheckpoint,
     TraceObservation,
     TraceValidation,
+    discard_worktree_observation_changes,
     inventory_observations,
 )
 from shea_halo.runtime_fs import append_runtime_text
 from shea_halo.security import sanitize_persisted_data, sanitize_persisted_text
-from shea_halo.workpad import MARKER, WorkpadHead, find_head, next_entry, render_entry
-from shea_halo.workspace import WorkspaceManager, branch_name
+from shea_halo.workpad import (
+    WorkpadHead,
+    find_head,
+    next_entry,
+    render_entry,
+    trusted_workpad_comment_ids,
+)
+from shea_halo.workspace import HaloWorkspace, WorkspaceManager, branch_name
 
 
 class ServiceError(RuntimeError):
@@ -51,6 +66,7 @@ class HaloService:
         self.configs = configs
         self.investigator = investigator or Investigator()
         self.halo_engine = halo_engine or HaloEngineAdapter()
+        self._terminal_items_seen: set[tuple[Path, str, str, str]] = set()
 
     async def run_once(self) -> None:
         for config in self.configs:
@@ -58,11 +74,27 @@ class HaloService:
                 with target_worker_lock(config.logs_dir):
                     github = GitHubClient(config.tracker)
                     metadata = github.project_metadata()
-                    for issue in github.list_research_issues():
+                    for issue in github.list_project_issues():
                         if issue.repository.casefold() != config.repository.casefold():
                             continue
                         try:
-                            await self._process(config, github, metadata, issue)
+                            if issue.status == config.tracker.research_state:
+                                self._terminal_items_seen = {
+                                    key
+                                    for key in self._terminal_items_seen
+                                    if key[:2] != (config.root, issue.item_id)
+                                }
+                                await self._process(config, github, metadata, issue)
+                            else:
+                                terminal_key = (
+                                    config.root,
+                                    issue.item_id,
+                                    issue.status,
+                                    issue.updated_at,
+                                )
+                                if terminal_key not in self._terminal_items_seen:
+                                    self._reconcile_terminal_transition(config, github, issue)
+                                    self._terminal_items_seen.add(terminal_key)
                         except Exception as exc:
                             self._log(config, issue, "run_failed", {"error": str(exc)})
             except TargetLockUnavailable:
@@ -79,12 +111,22 @@ class HaloService:
     ) -> None:
         producer = github.current_user()
         comments = github.issue_comments(issue.repository, issue.number)
-        discussion = self._discussion_context(comments)
+        trusted_producers = {producer, *config.tracker.trusted_producers}
+        trusted_comment_ids = trusted_workpad_comment_ids(
+            comments,
+            repository=issue.repository,
+            issue_number=issue.number,
+            trusted_producers=trusted_producers,
+        )
+        discussion = self._discussion_context(
+            comments,
+            trusted_workpad_comment_ids=trusted_comment_ids,
+        )
         head = find_head(
             comments,
             repository=issue.repository,
             issue_number=issue.number,
-            trusted_producers={producer, *config.tracker.trusted_producers},
+            trusted_producers=trusted_producers,
         )
         is_reentry = head is not None
         previous_result = head.entry.state.result if head is not None else None
@@ -118,6 +160,42 @@ class HaloService:
 
         github.assert_branch_has_no_pull_requests(issue.repository, workspace_branch)
         manager = WorkspaceManager(config)
+        if (
+            head.entry.state.phase == "experimenting"
+            and head.entry.state.result is None
+            and head.entry.state.publication_intent is None
+        ):
+            persisted_base = head.entry.state.base_revision
+            if persisted_base is None:
+                raise ServiceError("interrupted experiment has no persisted base revision")
+            manager.recover_abandoned_attempt(
+                issue_number=issue.number,
+                persisted_branch=workspace_branch,
+                persisted_base_revision=persisted_base,
+                expected_snapshot=head.entry.state.branch,
+            )
+            recovered = HaloState(
+                issue_repository=issue.repository,
+                issue_number=issue.number,
+                run_id=run_id,
+                phase="research",
+                workspace_branch=workspace_branch,
+                base_revision=persisted_base,
+                branch=head.entry.state.branch,
+            )
+            head = self._append(
+                github,
+                issue,
+                head,
+                producer,
+                recovered,
+                (
+                    "Recovered a kill-interrupted attempt before publication. Halo "
+                    "discarded its unrecorded source and ignored worktree state."
+                ),
+            )
+            previous_result = None
+
         if head.entry.state.publication_intent is not None:
             pending = head.entry.state.publication_intent
             pending_result = head.entry.state.result
@@ -141,38 +219,92 @@ class HaloService:
                 title=issue.title,
                 expected_snapshot=head.entry.state.branch,
             )
-            pending_result = pending_result.model_copy(
-                update={
-                    "trace_validation": self._with_candidate_revision(
-                        pending_result.trace_validation,
-                        snapshot.head_revision,
-                    )
-                }
+            workspace = manager.prepare_validation_workspace(
+                workspace,
+                issue_number=issue.number,
+                persisted_base_revision=workspace.base_revision,
+                expected_snapshot=snapshot,
             )
-            result = self._gate_outcome(pending_result)
-            phase, target_status, summary = self._route(config, result)
-            final_state = HaloState(
+            validating = HaloState(
                 issue_repository=issue.repository,
                 issue_number=issue.number,
                 run_id=run_id,
-                phase=phase,
+                phase="validating",
                 workspace_branch=workspace_branch,
                 base_revision=workspace.base_revision,
                 branch=snapshot,
-                input_fingerprint=self._input_fingerprint(
-                    config=config,
-                    issue=issue,
-                    discussion=discussion,
-                    checkpoint=inventory_observations(config, workspace),
-                    branch=snapshot,
-                ),
-                result=result,
+                validation_baseline=inventory_observations(config, workspace),
+                input_fingerprint=head.entry.state.input_fingerprint,
+                result=pending_result,
             )
-            github.assert_branch_has_no_pull_requests(issue.repository, workspace_branch)
-            self._append(github, issue, head, producer, final_state, summary)
-            if target_status is not None:
-                github.assert_issue_remains_in_research(issue)
-                github.set_status(metadata, issue.item_id, target_status)
+            head = self._append(
+                github,
+                issue,
+                head,
+                producer,
+                validating,
+                (
+                    f"Published `{snapshot.head_revision}` and started revision-bound "
+                    "candidate validation."
+                ),
+            )
+            await self._validate_candidate(
+                config=config,
+                github=github,
+                metadata=metadata,
+                issue=issue,
+                producer=producer,
+                head=head,
+                manager=manager,
+                workspace=workspace,
+                workspace_branch=workspace_branch,
+                run_id=run_id,
+                snapshot=snapshot,
+                preliminary_result=pending_result,
+                discussion=discussion,
+            )
+            return
+
+        if head.entry.state.phase == "validating" and head.entry.state.result is not None:
+            preliminary_result = head.entry.state.result
+            persisted_base = head.entry.state.base_revision
+            if persisted_base is None:
+                raise ServiceError("interrupted candidate validation has no persisted base")
+            workspace = manager.recover_abandoned_attempt(
+                issue_number=issue.number,
+                persisted_branch=workspace_branch,
+                persisted_base_revision=persisted_base,
+                expected_snapshot=head.entry.state.branch,
+            )
+            recovered_validation = head.entry.state.model_copy(
+                update={"updated_at": datetime.now(UTC)}
+            )
+            head = self._append(
+                github,
+                issue,
+                head,
+                producer,
+                recovered_validation,
+                (
+                    "Recovered an interrupted revision-bound validation and discarded "
+                    "all branch-external worktree state before rerunning it."
+                ),
+            )
+            await self._validate_candidate(
+                config=config,
+                github=github,
+                metadata=metadata,
+                issue=issue,
+                producer=producer,
+                head=head,
+                manager=manager,
+                workspace=workspace,
+                workspace_branch=workspace_branch,
+                run_id=run_id,
+                snapshot=head.entry.state.branch,
+                preliminary_result=preliminary_result,
+                discussion=discussion,
+            )
             return
 
         if not os.getenv("OPENAI_API_KEY"):
@@ -192,28 +324,25 @@ class HaloService:
                     blocker_verified=True,
                 )
             )
-            phase, target_status, summary = self._route(config, result)
             state = HaloState(
                 issue_repository=issue.repository,
                 issue_number=issue.number,
                 run_id=run_id,
-                phase=phase,
+                phase="blocked",
                 workspace_branch=workspace_branch,
                 base_revision=head.entry.state.base_revision,
                 branch=head.entry.state.branch,
                 result=result,
             )
-            self._append(
-                github,
-                issue,
-                head,
-                producer,
-                state,
-                summary,
+            self._finish(
+                config=config,
+                github=github,
+                metadata=metadata,
+                issue=issue,
+                producer=producer,
+                head=head,
+                state=state,
             )
-            if target_status is not None:
-                github.assert_issue_remains_in_research(issue)
-                github.set_status(metadata, issue.item_id, target_status)
             return
 
         workspace = manager.prepare(
@@ -225,6 +354,35 @@ class HaloService:
             publication_intent=None,
             allow_existing=is_reentry,
         )
+        current_base_revision = manager.current_base_revision()
+        if current_base_revision != workspace.base_revision:
+            result = self._base_revision_drift_result(
+                InvestigationResult(
+                    outcome=Outcome.CONTINUE_RESEARCH,
+                    summary="The configured base branch advanced during Halo research.",
+                ),
+                persisted_revision=workspace.base_revision,
+                current_revision=current_base_revision,
+            )
+            self._finish(
+                config=config,
+                github=github,
+                metadata=metadata,
+                issue=issue,
+                producer=producer,
+                head=head,
+                state=HaloState(
+                    issue_repository=issue.repository,
+                    issue_number=issue.number,
+                    run_id=run_id,
+                    phase="blocked",
+                    workspace_branch=workspace_branch,
+                    base_revision=workspace.base_revision,
+                    branch=head.entry.state.branch,
+                    result=result,
+                ),
+            )
+            return
         starting_checkpoint = inventory_observations(config, workspace)
         input_fingerprint = self._input_fingerprint(
             config=config,
@@ -261,24 +419,70 @@ class HaloService:
             ),
         )
 
-        halo_analysis = await self.halo_engine.analyze(
-            config=config,
-            workspace=workspace,
-            run_id=run_id,
-            issue_title=issue.title,
-            issue_body=issue.body,
-        )
-        result = await self.investigator.run(
-            config=config,
-            workspace=workspace,
-            run_id=run_id,
-            issue_number=issue.number,
-            issue_title=issue.title,
-            issue_body=issue.body,
-            issue_discussion=discussion,
-            prior_result=previous_result,
-            halo_analysis=halo_analysis,
-        )
+        try:
+            halo_analysis = await self.halo_engine.analyze(
+                config=config,
+                workspace=workspace,
+                run_id=run_id,
+                issue_title=issue.title,
+                issue_body=issue.body,
+            )
+            result = await self.investigator.run(
+                config=config,
+                workspace=workspace,
+                run_id=run_id,
+                issue_number=issue.number,
+                issue_title=issue.title,
+                issue_body=issue.body,
+                issue_discussion=discussion,
+                prior_result=previous_result,
+                halo_analysis=halo_analysis,
+            )
+        except Exception as exc:
+            manager.discard_unpublished_attempt(
+                workspace,
+                issue_number=issue.number,
+                persisted_base_revision=workspace.base_revision,
+                expected_snapshot=head.entry.state.branch,
+            )
+            result = InvestigationResult(
+                outcome=Outcome.CONTINUE_RESEARCH,
+                summary="The current research attempt stopped before publication.",
+                residual_risks=[
+                    (f"{type(exc).__name__}: {sanitize_persisted_text(str(exc))[:1_000]}")
+                ],
+            )
+            failed = HaloState(
+                issue_repository=issue.repository,
+                issue_number=issue.number,
+                run_id=run_id,
+                phase="experimenting",
+                workspace_branch=workspace_branch,
+                base_revision=workspace.base_revision,
+                branch=head.entry.state.branch,
+                input_fingerprint=input_fingerprint,
+                result=result,
+            )
+            self._append(
+                github,
+                issue,
+                head,
+                producer,
+                failed,
+                (
+                    "The attempt failed before a publication intent was recorded. "
+                    "Halo discarded its uncommitted source changes and retained the "
+                    "failure as shared evidence."
+                ),
+            )
+            self._log(
+                config,
+                issue,
+                "attempt_failed",
+                {"error": str(exc), "run_id": run_id},
+            )
+            return
+
         current_changed_paths = tuple(result.changed_paths)
         if previous_result is not None and previous_result.trace_validation_required:
             result = result.model_copy(
@@ -287,76 +491,6 @@ class HaloService:
                     "changed_paths": result.changed_paths or previous_result.changed_paths,
                 }
             )
-
-        checkpoint = inventory_observations(config, workspace)
-        previous_validation = (
-            previous_result.trace_validation if previous_result is not None else None
-        )
-        if current_changed_paths or previous_validation is None:
-            reference_checkpoint = starting_checkpoint
-            prior_traces: tuple[TraceObservation, ...] = ()
-            prior_reports: tuple[FileObservation, ...] = ()
-        else:
-            reference_checkpoint = previous_validation.checkpoint
-            current_traces = {item.label: item for item in checkpoint.traces}
-            current_reports = {item.label: item for item in checkpoint.desktop_reports}
-            prior_traces = tuple(
-                item
-                for item in previous_validation.candidate_traces
-                if current_traces.get(item.label) == item
-            )
-            prior_reports = tuple(
-                item
-                for item in previous_validation.candidate_desktop_reports
-                if current_reports.get(item.label) == item
-            )
-        delta = checkpoint.delta_from(reference_checkpoint)
-        candidate_traces = self._merge_trace_observations(
-            prior_traces,
-            (
-                *delta.new_traces,
-                *(item.current for item in delta.changed_traces),
-            ),
-        )
-        candidate_reports = self._merge_file_observations(
-            prior_reports,
-            (
-                *delta.new_desktop_reports,
-                *(item.current for item in delta.changed_desktop_reports),
-            ),
-        )
-        post_analysis = None
-        if result.trace_validation_required and candidate_traces:
-            post_analysis = await self.halo_engine.analyze(
-                config=config,
-                workspace=workspace,
-                run_id=f"{run_id}-candidate",
-                issue_title=issue.title,
-                issue_body=issue.body,
-                trace_sha256s=frozenset(trace.sha256 for trace in candidate_traces),
-            )
-            if post_analysis is not None and post_analysis.final_message:
-                result = result.model_copy(
-                    update={
-                        "analysis_sha256": hashlib.sha256(
-                            post_analysis.final_message.encode()
-                        ).hexdigest()
-                    }
-                )
-        candidate_revision = (
-            head.entry.state.branch.head_revision
-            if not current_changed_paths and head.entry.state.branch is not None
-            else None
-        )
-        trace_validation = self._trace_validation(
-            checkpoint=checkpoint,
-            candidate_traces=candidate_traces,
-            candidate_reports=candidate_reports,
-            halo_analysis=post_analysis,
-            candidate_revision=candidate_revision,
-        )
-        publication_result = result.model_copy(update={"trace_validation": trace_validation})
-        result = self._gate_outcome(publication_result)
 
         snapshot = head.entry.state.branch
         if current_changed_paths:
@@ -376,7 +510,7 @@ class HaloService:
                 branch=snapshot,
                 publication_intent=intent,
                 input_fingerprint=input_fingerprint,
-                result=publication_result,
+                result=result,
             )
             head = self._append(
                 github,
@@ -395,18 +529,494 @@ class HaloService:
                 title=issue.title,
                 expected_snapshot=head.entry.state.branch,
             )
-            publication_result = publication_result.model_copy(
+
+        workspace = manager.prepare_validation_workspace(
+            workspace,
+            issue_number=issue.number,
+            persisted_base_revision=workspace.base_revision,
+            expected_snapshot=snapshot,
+        )
+        validating = HaloState(
+            issue_repository=issue.repository,
+            issue_number=issue.number,
+            run_id=run_id,
+            phase="validating",
+            workspace_branch=workspace_branch,
+            base_revision=workspace.base_revision,
+            branch=snapshot,
+            validation_baseline=inventory_observations(config, workspace),
+            input_fingerprint=input_fingerprint,
+            result=result,
+        )
+        github.assert_branch_has_no_pull_requests(issue.repository, workspace_branch)
+        head = self._append(
+            github,
+            issue,
+            head,
+            producer,
+            validating,
+            (
+                "The candidate revision is fixed. Halo is now rerunning the configured "
+                "runtime experiment and verification against that exact revision."
+            ),
+        )
+        await self._validate_candidate(
+            config=config,
+            github=github,
+            metadata=metadata,
+            issue=issue,
+            producer=producer,
+            head=head,
+            manager=manager,
+            workspace=workspace,
+            workspace_branch=workspace_branch,
+            run_id=run_id,
+            snapshot=snapshot,
+            preliminary_result=result,
+            discussion=discussion,
+        )
+
+    def _reconcile_terminal_transition(
+        self,
+        config: HaloConfig,
+        github: GitHubClient,
+        issue: ProjectIssue,
+    ) -> None:
+        """Finish the workpad half of a status change that already reached GitHub."""
+
+        producer = github.current_user()
+        comments = github.issue_comments(issue.repository, issue.number)
+        head = find_head(
+            comments,
+            repository=issue.repository,
+            issue_number=issue.number,
+            trusted_producers={producer, *config.tracker.trusted_producers},
+        )
+        if head is None:
+            return
+        transition = head.entry.state.status_transition
+        if transition is None:
+            return
+        result = head.entry.state.result
+        if result is None:
+            raise ServiceError("pending status transition has no persisted result")
+        expected_phase, expected_target, _ = self._route(config, result)
+        if (
+            expected_target is None
+            or head.entry.state.phase != expected_phase
+            or transition.target != expected_target
+        ):
+            raise ServiceError("status transition does not match its routed result")
+        if transition.state == "applied":
+            return
+        if transition.target != issue.status:
+            superseded = head.entry.state.model_copy(update={"status_transition": None})
+            self._append(
+                github,
+                issue,
+                head,
+                producer,
+                superseded,
+                (
+                    f"Project status `{issue.status}` superseded the pending Halo transition "
+                    f"to `{transition.target}`; Halo made no automatic status change."
+                ),
+                require_research=False,
+            )
+            self._log(
+                config,
+                issue,
+                "status_transition_mismatch",
+                {
+                    "current_status": issue.status,
+                    "pending_target": transition.target,
+                },
+            )
+            return
+        applied = head.entry.state.model_copy(
+            update={
+                "status_transition": StatusTransition(
+                    target=transition.target,
+                    state="applied",
+                    created_at=transition.created_at,
+                    applied_at=datetime.now(UTC),
+                )
+            }
+        )
+        self._append(
+            github,
+            issue,
+            head,
+            producer,
+            applied,
+            (
+                f"Confirmed the previously applied Project status "
+                f"`{transition.target}` after worker recovery."
+            ),
+            require_research=False,
+        )
+
+    async def _validate_candidate(
+        self,
+        config: HaloConfig,
+        *,
+        github: GitHubClient,
+        metadata: ProjectMetadata,
+        issue: ProjectIssue,
+        producer: str,
+        head: WorkpadHead,
+        manager: WorkspaceManager,
+        workspace: HaloWorkspace,
+        workspace_branch: str,
+        run_id: str,
+        snapshot: BranchSnapshot | None,
+        preliminary_result: InvestigationResult,
+        discussion: str,
+    ) -> None:
+        """Validate only evidence produced after the candidate revision is fixed."""
+
+        workspace = manager.prepare_validation_workspace(
+            workspace,
+            issue_number=issue.number,
+            persisted_base_revision=workspace.base_revision,
+            expected_snapshot=snapshot,
+        )
+        candidate_revision = (
+            snapshot.head_revision if snapshot is not None else workspace.base_revision
+        )
+        baseline = head.entry.state.validation_baseline
+        if baseline is None:
+            raise ServiceError("candidate validation has no persisted observation baseline")
+        try:
+            setup_actions = run_configured_stage(
+                config,
+                workspace.path,
+                kind="setup",
+                stage="setup",
+                service_version=candidate_revision,
+            )
+            experiment_baseline = inventory_observations(config, workspace)
+            experiment_actions = run_configured_stage(
+                config,
+                workspace.path,
+                kind="experiment",
+                stage="candidate_validation",
+                service_version=candidate_revision,
+            )
+            experiment_checkpoint = inventory_observations(config, workspace)
+            verification, verification_actions = run_verification(
+                config,
+                workspace.path,
+                service_version=candidate_revision,
+            )
+            checkpoint = inventory_observations(config, workspace)
+        except Exception as exc:
+            manager.discard_unpublished_attempt(
+                workspace,
+                issue_number=issue.number,
+                persisted_base_revision=workspace.base_revision,
+                expected_snapshot=snapshot,
+            )
+            try:
+                removed_observations = discard_worktree_observation_changes(
+                    config,
+                    workspace,
+                    baseline,
+                )
+            except Exception as cleanup_exc:
+                blocked = preliminary_result.model_copy(
+                    update={
+                        "outcome": Outcome.BLOCKED,
+                        "residual_risks": [
+                            *preliminary_result.residual_risks,
+                            (
+                                "Revision-bound validation failed and its observation "
+                                "artifact could not be discarded safely: "
+                                f"{type(cleanup_exc).__name__}: "
+                                f"{sanitize_persisted_text(str(cleanup_exc))[:1_000]}"
+                            ),
+                        ],
+                        "blocker": ExternalBlocker(
+                            category="permission",
+                            description=(
+                                "A failed validation left an observation artifact outside "
+                                "Halo's safe cleanup boundary."
+                            ),
+                            required_action=(
+                                "Inspect and remove or relocate the reported validation "
+                                "artifact, then move the item back to Halo Research."
+                            ),
+                        ),
+                        "blocker_verified": True,
+                    }
+                )
+                self._finish(
+                    config=config,
+                    github=github,
+                    metadata=metadata,
+                    issue=issue,
+                    producer=producer,
+                    head=head,
+                    state=HaloState(
+                        issue_repository=issue.repository,
+                        issue_number=issue.number,
+                        run_id=run_id,
+                        phase="blocked",
+                        workspace_branch=workspace_branch,
+                        base_revision=workspace.base_revision,
+                        branch=snapshot,
+                        result=blocked,
+                    ),
+                )
+                self._log(
+                    config,
+                    issue,
+                    "validation_cleanup_blocked",
+                    {
+                        "error": str(exc),
+                        "cleanup_error": str(cleanup_exc),
+                        "run_id": run_id,
+                    },
+                )
+                return
+            failed = preliminary_result.model_copy(
                 update={
-                    "trace_validation": self._trace_validation(
-                        checkpoint=checkpoint,
-                        candidate_traces=candidate_traces,
-                        candidate_reports=candidate_reports,
-                        halo_analysis=post_analysis,
-                        candidate_revision=snapshot.head_revision,
-                    )
+                    "outcome": Outcome.CONTINUE_RESEARCH,
+                    "residual_risks": [
+                        *preliminary_result.residual_risks,
+                        (
+                            "Revision-bound validation failed: "
+                            f"{type(exc).__name__}: "
+                            f"{sanitize_persisted_text(str(exc))[:1_000]}"
+                        ),
+                    ],
                 }
             )
-            result = self._gate_outcome(publication_result)
+            state = HaloState(
+                issue_repository=issue.repository,
+                issue_number=issue.number,
+                run_id=run_id,
+                phase="experimenting",
+                workspace_branch=workspace_branch,
+                base_revision=workspace.base_revision,
+                branch=snapshot,
+                input_fingerprint=None,
+                result=failed,
+            )
+            self._append(
+                github,
+                issue,
+                head,
+                producer,
+                state,
+                (
+                    "Revision-bound validation stopped. Halo discarded non-ignored source "
+                    f"changes and {len(removed_observations)} changed observation artifact(s), "
+                    "then kept the item in `Halo Research` for a clean re-entry."
+                ),
+            )
+            self._log(
+                config,
+                issue,
+                "validation_failed",
+                {"error": str(exc), "run_id": run_id},
+            )
+            return
+
+        unexpected_intent = manager.create_publication_intent(
+            workspace,
+            expected_snapshot=snapshot,
+        )
+        source_clean = unexpected_intent is None
+        if not source_clean:
+            manager.discard_unpublished_attempt(
+                workspace,
+                issue_number=issue.number,
+                persisted_base_revision=workspace.base_revision,
+                expected_snapshot=snapshot,
+            )
+
+        candidate_traces, candidate_reports = self._stable_experiment_observations(
+            before=experiment_baseline,
+            after=experiment_checkpoint,
+            final=checkpoint,
+        )
+
+        post_analysis = None
+        if candidate_traces:
+            post_analysis = await self.halo_engine.analyze(
+                config=config,
+                workspace=workspace,
+                run_id=f"{run_id}-candidate",
+                issue_title=issue.title,
+                issue_body=issue.body,
+                trace_sha256s=frozenset(trace.sha256 for trace in candidate_traces),
+            )
+
+        analysis_sha256 = None
+        trace_validation = TraceValidation(
+            checkpoint=checkpoint,
+            candidate_traces=candidate_traces,
+            candidate_desktop_reports=candidate_reports,
+            candidate_revision=candidate_revision,
+        )
+        validation_actions = [
+            *setup_actions,
+            *experiment_actions,
+            *verification_actions,
+        ]
+        try:
+            if post_analysis is not None and post_analysis.final_message:
+                # This enforces the exact same bounded UTF-8 report contract used
+                # by the prompt and evidence source before any digest is trusted.
+                candidate_evidence_references(
+                    candidate_revision=candidate_revision,
+                    halo_analysis=post_analysis,
+                    candidate_traces=candidate_traces,
+                )
+                analysis_sha256 = hashlib.sha256(
+                    post_analysis.final_message.encode("utf-8")
+                ).hexdigest()
+            trace_validation = self._trace_validation(
+                checkpoint=checkpoint,
+                candidate_traces=candidate_traces,
+                candidate_reports=candidate_reports,
+                halo_analysis=post_analysis,
+                candidate_revision=candidate_revision,
+            )
+            decision = await self.investigator.synthesize_candidate(
+                config=config,
+                issue_number=issue.number,
+                issue_title=issue.title,
+                issue_body=issue.body,
+                issue_discussion=discussion,
+                candidate_revision=candidate_revision,
+                preliminary_result=preliminary_result,
+                halo_analysis=post_analysis,
+                candidate_traces=candidate_traces,
+                trace_validation=trace_validation,
+                validation_actions=validation_actions,
+                verification=verification,
+                source_clean=source_clean,
+            )
+            validate_candidate_synthesis(
+                decision,
+                candidate_revision=candidate_revision,
+                halo_analysis=post_analysis,
+                candidate_traces=candidate_traces,
+            )
+        except Exception as exc:
+            manager.prepare_validation_workspace(
+                workspace,
+                issue_number=issue.number,
+                persisted_base_revision=workspace.base_revision,
+                expected_snapshot=snapshot,
+            )
+            failed = InvestigationResult(
+                outcome=Outcome.CONTINUE_RESEARCH,
+                summary=(
+                    "The exact candidate evidence was collected, but its final "
+                    "read-only synthesis did not complete."
+                ),
+                analysis_sha256=analysis_sha256,
+                selected_guides=preliminary_result.selected_guides,
+                changed_paths=preliminary_result.changed_paths,
+                trace_validation_required=preliminary_result.trace_validation_required,
+                trace_validation=trace_validation,
+                executed_actions=[
+                    *preliminary_result.executed_actions,
+                    *validation_actions,
+                ],
+                verification=verification,
+                residual_risks=[
+                    (
+                        "Final candidate synthesis failed closed: "
+                        f"{type(exc).__name__}: "
+                        f"{sanitize_persisted_text(str(exc))[:1_000]}"
+                    )
+                ],
+            )
+            self._append(
+                github,
+                issue,
+                head,
+                producer,
+                HaloState(
+                    issue_repository=issue.repository,
+                    issue_number=issue.number,
+                    run_id=run_id,
+                    phase="experimenting",
+                    workspace_branch=workspace_branch,
+                    base_revision=workspace.base_revision,
+                    branch=snapshot,
+                    input_fingerprint=None,
+                    result=failed,
+                ),
+                (
+                    "Final candidate synthesis failed closed. Halo kept the published "
+                    "snapshot, discarded branch-external worktree state, and left the "
+                    "item in `Halo Research` for a fresh re-entry."
+                ),
+            )
+            self._log(
+                config,
+                issue,
+                "candidate_synthesis_failed",
+                {"error": str(exc), "run_id": run_id},
+            )
+            return
+        result = InvestigationResult(
+            outcome=decision.outcome,
+            summary=decision.summary,
+            evidence=decision.evidence,
+            analysis_sha256=analysis_sha256,
+            competing_hypotheses=decision.competing_hypotheses,
+            experiments=decision.experiments,
+            selected_guides=preliminary_result.selected_guides,
+            changed_paths=preliminary_result.changed_paths,
+            trace_validation_required=preliminary_result.trace_validation_required,
+            trace_validation=trace_validation,
+            executed_actions=[
+                *preliminary_result.executed_actions,
+                *validation_actions,
+            ],
+            verification=verification,
+            residual_risks=decision.residual_risks,
+            todo_handoff=decision.todo_handoff,
+            blocker=decision.blocker,
+            blocker_verified=False,
+        )
+        result = result.model_copy(
+            update={
+                "blocker_verified": self._blocker_verified_at_revision(
+                    result,
+                    validation_actions,
+                    candidate_revision=candidate_revision,
+                    allowed_exit_codes=config.external_blocker_exit_codes,
+                )
+            }
+        )
+        if not source_clean:
+            result = result.model_copy(
+                update={
+                    "outcome": Outcome.CONTINUE_RESEARCH,
+                    "residual_risks": [
+                        *result.residual_risks,
+                        (
+                            "A candidate-validation command changed repository source "
+                            "after publication; Halo discarded that unrecorded change."
+                        ),
+                    ],
+                }
+            )
+        current_base_revision = manager.current_base_revision()
+        if current_base_revision != workspace.base_revision:
+            result = self._base_revision_drift_result(
+                result,
+                persisted_revision=workspace.base_revision,
+                current_revision=current_base_revision,
+            )
+        result = self._gate_outcome(result)
         if result.outcome == Outcome.READY_FOR_TODO and result.changed_paths and snapshot is None:
             result = result.model_copy(
                 update={
@@ -418,8 +1028,8 @@ class HaloService:
                 }
             )
 
-        phase, target_status, summary = self._route(config, result)
-        final_state = HaloState(
+        phase, _, _ = self._route(config, result)
+        state = HaloState(
             issue_repository=issue.repository,
             issue_number=issue.number,
             run_id=run_id,
@@ -437,10 +1047,15 @@ class HaloService:
             result=result,
         )
         github.assert_branch_has_no_pull_requests(issue.repository, workspace_branch)
-        self._append(github, issue, head, producer, final_state, summary)
-        if target_status is not None:
-            github.assert_issue_remains_in_research(issue)
-            github.set_status(metadata, issue.item_id, target_status)
+        self._finish(
+            config=config,
+            github=github,
+            metadata=metadata,
+            issue=issue,
+            producer=producer,
+            head=head,
+            state=state,
+        )
         self._log(
             config,
             issue,
@@ -452,6 +1067,59 @@ class HaloService:
             },
         )
 
+    def _finish(
+        self,
+        *,
+        config: HaloConfig,
+        github: GitHubClient,
+        metadata: ProjectMetadata,
+        issue: ProjectIssue,
+        producer: str,
+        head: WorkpadHead,
+        state: HaloState,
+    ) -> WorkpadHead:
+        if state.result is None:
+            raise ServiceError("a routed Halo state requires an investigation result")
+        phase, target_status, summary = self._route(config, state.result)
+        pending_transition = (
+            None
+            if target_status is None
+            else StatusTransition(target=target_status, state="pending")
+        )
+        routed = state.model_copy(
+            update={
+                "phase": phase,
+                "status_transition": pending_transition,
+            }
+        )
+        head = self._append(github, issue, head, producer, routed, summary)
+        if target_status is None:
+            return head
+
+        github.assert_issue_remains_in_research(issue)
+        github.set_status(metadata, issue.item_id, target_status)
+        if pending_transition is None:
+            raise ServiceError("terminal routing lost its pending status transition")
+        applied = routed.model_copy(
+            update={
+                "status_transition": StatusTransition(
+                    target=target_status,
+                    state="applied",
+                    created_at=pending_transition.created_at,
+                    applied_at=datetime.now(UTC),
+                )
+            }
+        )
+        return self._append(
+            github,
+            issue,
+            head,
+            producer,
+            applied,
+            f"Applied the configured Project status `{target_status}`.",
+            require_research=False,
+        )
+
     @staticmethod
     def _append(
         github: GitHubClient,
@@ -460,8 +1128,11 @@ class HaloService:
         producer: str,
         state: HaloState,
         summary: str,
+        *,
+        require_research: bool = True,
     ) -> WorkpadHead:
-        github.assert_issue_remains_in_research(issue)
+        if require_research:
+            github.assert_issue_remains_in_research(issue)
         entry = next_entry(state, head, producer=producer)
         comment = github.add_comment(
             issue.repository,
@@ -477,6 +1148,26 @@ class HaloService:
         """Demote unsupported terminal claims to continued research."""
 
         missing: list[str] = []
+        candidate_actions = [
+            action
+            for action in result.executed_actions
+            if action.kind == "experiment" and action.stage == "candidate_validation"
+        ]
+        successful_candidate_indices = {
+            action.index for action in candidate_actions if action.exit_code == 0
+        }
+        setup_actions = [action for action in result.executed_actions if action.stage == "setup"]
+        experiments_are_bound = bool(result.experiments) and all(
+            experiment.action_index in successful_candidate_indices
+            and experiment.hypothesis.strip()
+            and experiment.action.strip()
+            and experiment.result.strip()
+            for experiment in result.experiments
+        )
+        candidate_runtime_passed = bool(candidate_actions) and all(
+            action.exit_code == 0 and action.service_version for action in candidate_actions
+        )
+        setup_passed = all(action.exit_code == 0 for action in setup_actions)
         if result.outcome == Outcome.BLOCKED:
             if (
                 result.blocker is None
@@ -492,18 +1183,20 @@ class HaloService:
                 not item.claim.strip() or not item.source.strip() for item in result.evidence
             ):
                 missing.append("A Todo handoff requires evidence.")
-            if not result.experiments or any(
-                not item.hypothesis.strip() or not item.action.strip() or not item.result.strip()
-                for item in result.experiments
-            ):
-                missing.append("A Todo handoff requires completed experiments.")
+            if not experiments_are_bound:
+                missing.append(
+                    "A Todo handoff requires completed experiments bound to successful "
+                    "revision-bound runtime actions."
+                )
             if not result.todo_handoff or not result.todo_handoff.strip():
                 missing.append("A Todo handoff requires implementation guidance.")
-            if not result.executed_actions or not any(
-                action.kind == "experiment" and action.exit_code == 0
-                for action in result.executed_actions
-            ):
-                missing.append("A Todo handoff requires a successful runtime-recorded experiment.")
+            if not setup_passed:
+                missing.append("A Todo handoff requires all configured setup actions to pass.")
+            if not candidate_runtime_passed:
+                missing.append(
+                    "A Todo handoff requires every configured revision-bound runtime "
+                    "experiment to pass."
+                )
             if result.trace_validation_required and (
                 not result.selected_guides or any(guide.stale for guide in result.selected_guides)
             ):
@@ -515,9 +1208,8 @@ class HaloService:
                 result.trace_validation is None or not result.trace_validation.complete
             ):
                 missing.append(
-                    "A Todo handoff requires a new candidate trace hierarchy, a new HALO "
-                    "Desktop report, post-experiment HALO Engine analysis, and the published "
-                    "candidate revision."
+                    "A Todo handoff requires a new candidate trace hierarchy, exact-dataset "
+                    "post-experiment HALO Engine analysis, and the published candidate revision."
                 )
             if not result.verification or any(
                 check.status != "passed" for check in result.verification
@@ -530,19 +1222,31 @@ class HaloService:
                 not item.claim.strip() or not item.source.strip() for item in result.evidence
             ):
                 missing.append("A no-change conclusion requires evidence.")
-            if not result.experiments or any(
-                not item.hypothesis.strip() or not item.action.strip() or not item.result.strip()
-                for item in result.experiments
-            ):
-                missing.append("A no-change conclusion requires completed experiments.")
-            if result.changed_paths:
-                missing.append("A no-change conclusion conflicts with experiment file changes.")
-            if not result.executed_actions or not any(
-                action.kind == "experiment" and action.exit_code == 0
-                for action in result.executed_actions
+            if not experiments_are_bound:
+                missing.append(
+                    "A no-change conclusion requires completed experiments bound to successful "
+                    "revision-bound runtime actions."
+                )
+            if not setup_passed:
+                missing.append("A no-change conclusion requires all setup actions to pass.")
+            if not candidate_runtime_passed:
+                missing.append(
+                    "A no-change conclusion requires every configured revision-bound "
+                    "runtime experiment to pass."
+                )
+            if result.trace_validation_required and (
+                not result.selected_guides or any(guide.stale for guide in result.selected_guides)
             ):
                 missing.append(
-                    "A no-change conclusion requires a successful runtime-recorded experiment."
+                    "Tracing experiments require at least one current framework guide "
+                    "and no stale selected guide."
+                )
+            if result.trace_validation_required and (
+                result.trace_validation is None or not result.trace_validation.complete
+            ):
+                missing.append(
+                    "A tracing-based no-change conclusion requires a new candidate trace "
+                    "hierarchy, exact-dataset HALO analysis, and the published revision."
                 )
             if not result.verification or any(
                 check.status != "passed" for check in result.verification
@@ -565,22 +1269,64 @@ class HaloService:
         )
 
     @staticmethod
-    def _merge_trace_observations(
-        previous: tuple[TraceObservation, ...],
-        current: tuple[TraceObservation, ...],
-    ) -> tuple[TraceObservation, ...]:
-        merged = {item.label: item for item in previous}
-        merged.update({item.label: item for item in current})
-        return tuple(merged[label] for label in sorted(merged))
+    def _base_revision_drift_result(
+        result: InvestigationResult,
+        *,
+        persisted_revision: str,
+        current_revision: str,
+    ) -> InvestigationResult:
+        return result.model_copy(
+            update={
+                "outcome": Outcome.BLOCKED,
+                "summary": "The configured base branch advanced during Halo research.",
+                "residual_risks": [
+                    *result.residual_risks,
+                    (
+                        "The research lifecycle is pinned to "
+                        f"`{persisted_revision}` while the configured base now resolves to "
+                        f"`{current_revision}`. Do not promote evidence across that drift."
+                    ),
+                ],
+                "blocker": ExternalBlocker(
+                    category="missing_input",
+                    description=(
+                        "The target base branch advanced after this Halo lifecycle was pinned."
+                    ),
+                    required_action=(
+                        "Start a fresh Halo Research lifecycle for the new base, or explicitly "
+                        "review the pinned snapshot before deciding how to proceed."
+                    ),
+                ),
+                "blocker_verified": True,
+            }
+        )
 
     @staticmethod
-    def _merge_file_observations(
-        previous: tuple[FileObservation, ...],
-        current: tuple[FileObservation, ...],
-    ) -> tuple[FileObservation, ...]:
-        merged = {item.label: item for item in previous}
-        merged.update({item.label: item for item in current})
-        return tuple(merged[label] for label in sorted(merged))
+    def _blocker_verified_at_revision(
+        result: InvestigationResult,
+        actions: list[ExecutedAction],
+        *,
+        candidate_revision: str,
+        allowed_exit_codes: frozenset[int],
+    ) -> bool:
+        blocker = result.blocker
+        if result.outcome != Outcome.BLOCKED or blocker is None:
+            return False
+        failed_index = blocker.failed_action_index
+        if failed_index is None:
+            return False
+        if any(action.stage == "setup" and action.exit_code != 0 for action in actions):
+            return False
+        matching = [
+            action
+            for action in actions
+            if action.index == failed_index
+            and action.kind == "experiment"
+            and action.stage == "candidate_validation"
+            and action.service_version == candidate_revision
+            and action.exit_code in allowed_exit_codes
+        ]
+        return len(matching) == 1
 
     @staticmethod
     def _trace_validation(
@@ -593,10 +1339,16 @@ class HaloService:
     ) -> TraceValidation:
         report_digest: str | None = None
         dataset_digests: set[str] = set()
+        dataset_revision: str | None = None
         if halo_analysis is not None:
             final_message = getattr(halo_analysis, "final_message", None)
             dataset = getattr(halo_analysis, "dataset", None)
             files = getattr(dataset, "files", ()) if dataset is not None else ()
+            raw_revision = (
+                getattr(dataset, "harness_revision", None) if dataset is not None else None
+            )
+            if isinstance(raw_revision, str):
+                dataset_revision = raw_revision
             if isinstance(final_message, str) and final_message:
                 report_digest = hashlib.sha256(final_message.encode()).hexdigest()
             dataset_digests = {
@@ -605,12 +1357,24 @@ class HaloService:
                 if isinstance((digest := getattr(item, "sha256", None)), str)
             }
         candidate_digests = {item.sha256 for item in candidate_traces}
+        dataset_verified = bool(candidate_digests and candidate_digests == dataset_digests)
+        revision_verified = bool(candidate_revision and dataset_revision == candidate_revision)
+        service_version_verified = bool(
+            candidate_revision
+            and candidate_traces
+            and all(
+                item.label.startswith("worktree/")
+                and item.service_versions == (candidate_revision,)
+                and item.service_version_span_count == item.span_count
+                for item in candidate_traces
+            )
+        )
         complete = bool(
             candidate_traces
-            and candidate_reports
             and report_digest
-            and candidate_digests == dataset_digests
-            and candidate_revision
+            and dataset_verified
+            and revision_verified
+            and service_version_verified
             and any(item.parented_span_count > 0 for item in candidate_traces)
         )
         return TraceValidation(
@@ -618,37 +1382,57 @@ class HaloService:
             candidate_traces=candidate_traces,
             candidate_desktop_reports=candidate_reports,
             halo_report_sha256=report_digest,
-            halo_dataset_verified=bool(candidate_digests and candidate_digests == dataset_digests),
+            halo_dataset_verified=dataset_verified,
+            halo_revision_verified=revision_verified,
+            service_version_verified=service_version_verified,
             candidate_revision=candidate_revision,
             complete=complete,
         )
 
     @staticmethod
-    def _with_candidate_revision(
-        validation: TraceValidation | None,
-        revision: str,
-    ) -> TraceValidation | None:
-        if validation is None:
-            return None
-        complete = bool(
-            validation.candidate_traces
-            and validation.candidate_desktop_reports
-            and validation.halo_report_sha256
-            and validation.halo_dataset_verified
-            and any(trace.parented_span_count > 0 for trace in validation.candidate_traces)
+    def _stable_experiment_observations(
+        *,
+        before: ObservationCheckpoint,
+        after: ObservationCheckpoint,
+        final: ObservationCheckpoint,
+    ) -> tuple[tuple[TraceObservation, ...], tuple[FileObservation, ...]]:
+        """Select only worktree observations produced by the experiment stage.
+
+        Setup output is already present in ``before``. Verification-only output
+        appears only in ``final``. An experiment observation is accepted only
+        when its complete inventory record is unchanged after verification.
+        """
+
+        delta = after.delta_from(before)
+        final_traces = {item.label: item for item in final.traces}
+        final_reports = {item.label: item for item in final.desktop_reports}
+        traces = tuple(
+            trace
+            for trace in (
+                *delta.new_traces,
+                *(item.current for item in delta.changed_traces),
+            )
+            if trace.label.startswith("worktree/") and final_traces.get(trace.label) == trace
         )
-        return validation.model_copy(
-            update={
-                "candidate_revision": revision,
-                "complete": complete,
-            }
+        reports = tuple(
+            report
+            for report in (
+                *delta.new_desktop_reports,
+                *(item.current for item in delta.changed_desktop_reports),
+            )
+            if report.label.startswith("worktree/") and final_reports.get(report.label) == report
         )
+        return traces, reports
 
     @staticmethod
-    def _discussion_context(comments: list[IssueComment]) -> str:
+    def _discussion_context(
+        comments: list[IssueComment],
+        *,
+        trusted_workpad_comment_ids: frozenset[int],
+    ) -> str:
         discussion: list[dict[str, object]] = []
         for comment in comments:
-            if comment.body.lstrip().startswith(MARKER):
+            if comment.database_id in trusted_workpad_comment_ids:
                 continue
             discussion.append(
                 {
@@ -675,6 +1459,12 @@ class HaloService:
         branch: BranchSnapshot | None,
     ) -> str:
         branch_payload = branch.model_dump(mode="json") if branch is not None else None
+        runtime_environment = {
+            name: os.environ.get(name) is not None for name in config.target_environment_variables
+        }
+        effective_catalyst_endpoint = validate_catalyst_sdk_base_endpoint(
+            os.getenv("CATALYST_OTLP_ENDPOINT") or config.observation.catalyst_sdk_base_endpoint
+        )
         payload = {
             "daily_refresh": datetime.now(UTC).date().isoformat(),
             "issue": {
@@ -689,7 +1479,12 @@ class HaloService:
                 "base_branch": config.base_branch,
                 "trace_globs": config.observation.trace_globs,
                 "desktop_report_globs": config.observation.desktop_report_globs,
+                "catalyst_sdk_base_endpoint": effective_catalyst_endpoint,
+                "require_candidate_traces": config.observation.require_candidate_traces,
+                "experiment_environment_presence": runtime_environment,
+                "setup_commands": config.setup_commands,
                 "experiment_commands": config.experiment_commands,
+                "external_blocker_exit_codes": sorted(config.external_blocker_exit_codes),
                 "verification_commands": config.verification_commands,
                 "model": config.model,
                 "halo_model": config.halo_model,
@@ -719,7 +1514,10 @@ class HaloService:
             return (
                 "done",
                 config.tracker.done_state,
-                "The hypothesis was resolved without a code change; the research item is done.",
+                (
+                    "The hypothesis was resolved and no implementation change is recommended. "
+                    "Any Halo snapshot remains reference-only; the research item is done."
+                ),
             )
         if result.outcome == Outcome.BLOCKED:
             return (

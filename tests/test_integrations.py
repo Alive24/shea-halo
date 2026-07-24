@@ -7,6 +7,7 @@ import pytest
 
 from shea_halo.integrations import (
     INFERENCE_TRACE_CATALOG_URL,
+    MAX_DOCUMENT_BYTES,
     IntegrationCatalog,
     IntegrationError,
     discover_dependencies,
@@ -68,6 +69,30 @@ def test_dependency_scan_skips_runtime_and_install_trees(tmp_path: Path) -> None
     assert dependencies == {"pydantic-ai": "pydantic-ai==1.2"}
 
 
+def test_dependency_scan_reads_go_single_and_block_requirements(tmp_path: Path) -> None:
+    manifest = tmp_path / "go.mod"
+    manifest.write_text(
+        """\
+module example.com/agent
+
+go 1.24
+
+require go.opentelemetry.io/otel v1.35.0
+require (
+    github.com/openai/openai-go/v2 v2.6.0
+)
+""",
+        encoding="utf-8",
+    )
+
+    dependencies = discover_dependencies(tmp_path)
+
+    assert dependencies == {
+        "github.com/openai/openai-go/v2": "v2.6.0",
+        "go.opentelemetry.io/otel": "v1.35.0",
+    }
+
+
 def test_catalog_only_accepts_official_trace_markdown() -> None:
     guides = parse_trace_catalog(CATALOG)
 
@@ -107,6 +132,33 @@ def test_catalog_uses_only_the_official_machine_readable_index(tmp_path: Path) -
 
     with pytest.raises(IntegrationError, match="cache directory"):
         IntegrationCatalog(Path("https://example.com/catalog.txt"))
+
+
+def test_catalog_rejects_unbounded_official_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = integration_catalog(tmp_path)
+
+    class OversizedResponse:
+        def __enter__(self) -> OversizedResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        @staticmethod
+        def read(limit: int) -> bytes:
+            assert limit == MAX_DOCUMENT_BYTES + 1
+            return b"x" * limit
+
+    monkeypatch.setattr(
+        "shea_halo.integrations.urllib.request.urlopen",
+        lambda *_args, **_kwargs: OversizedResponse(),
+    )
+
+    with pytest.raises(IntegrationError, match="exceeded"):
+        catalog.load()
 
 
 def test_cached_catalog_marks_every_guide_stale(

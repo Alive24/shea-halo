@@ -13,7 +13,11 @@ from shea_halo.config import HaloConfig
 from shea_halo.observation import (
     ObservationCheckpoint,
     ObservationError,
+    SpanKindCount,
+    TraceObservation,
+    TraceValidation,
     diff_observation_checkpoints,
+    discard_worktree_observation_changes,
     inventory_observations,
 )
 from shea_halo.workspace import HaloWorkspace
@@ -25,7 +29,11 @@ def canonical_span(
     span_id: str,
     parent_span_id: str = "",
     span_kind: str = "AGENT",
+    service_version: str | None = None,
 ) -> dict[str, object]:
+    resource_attributes: dict[str, object] = {"service.name": "fixture"}
+    if service_version is not None:
+        resource_attributes["service.version"] = service_version
     return {
         "trace_id": trace_id,
         "span_id": span_id,
@@ -36,7 +44,7 @@ def canonical_span(
         "start_time": "2026-07-24T00:00:00Z",
         "end_time": "2026-07-24T00:00:01Z",
         "status": {"code": "STATUS_CODE_OK", "message": ""},
-        "resource": {"attributes": {"service.name": "fixture"}},
+        "resource": {"attributes": resource_attributes},
         "scope": {"name": "test", "version": "1"},
         "attributes": {"openinference.span.kind": span_kind},
     }
@@ -114,6 +122,30 @@ def test_inventory_is_stable_path_free_and_covers_both_roots(tmp_path: Path) -> 
     assert str(active.path) not in serialized
 
 
+def test_inventory_counts_every_span_bound_to_a_service_version(tmp_path: Path) -> None:
+    config, active = configured_roots(tmp_path)
+    trace = active.path / ".shea/artifacts/halo/traces/versioned.jsonl"
+    write_trace(
+        trace,
+        canonical_span(
+            trace_id="a" * 32,
+            span_id="1" * 16,
+            service_version="1" * 40,
+        ),
+        canonical_span(
+            trace_id="a" * 32,
+            span_id="2" * 16,
+            parent_span_id="1" * 16,
+        ),
+    )
+
+    [observation] = inventory_observations(config, active).traces
+
+    assert observation.service_versions == ("1" * 40,)
+    assert observation.service_version_span_count == 1
+    assert observation.span_count == 2
+
+
 def test_delta_contains_only_new_and_changed_current_observations(tmp_path: Path) -> None:
     config, active = configured_roots(tmp_path)
     trace = config.root / ".shea/artifacts/halo/traces/existing.jsonl"
@@ -161,6 +193,63 @@ def test_delta_contains_only_new_and_changed_current_observations(tmp_path: Path
     ]
     assert current.delta_from(previous) == delta
     assert not current.delta_from(current).has_changes
+
+
+def test_failed_validation_discards_malformed_worktree_observations_without_parsing(
+    tmp_path: Path,
+) -> None:
+    config, active = configured_roots(tmp_path)
+    existing = active.path / ".shea/artifacts/halo/traces/candidate.jsonl"
+    write_trace(existing, canonical_span(trace_id="a" * 32, span_id="1" * 16))
+    baseline = inventory_observations(config, active)
+    existing.write_text('{"partial":', encoding="utf-8")
+    new_report = active.path / ".shea/artifacts/halo/desktop/run/report.md"
+    new_report.parent.mkdir(parents=True)
+    new_report.write_text("partial report\n", encoding="utf-8")
+    target_artifact = config.root / ".shea/artifacts/halo/traces/target.jsonl"
+    target_artifact.parent.mkdir(parents=True, exist_ok=True)
+    target_artifact.write_text('{"operator-owned":', encoding="utf-8")
+
+    removed = discard_worktree_observation_changes(config, active, baseline)
+
+    assert removed == (
+        "worktree/.shea/artifacts/halo/desktop/run/report.md",
+        "worktree/.shea/artifacts/halo/traces/candidate.jsonl",
+    )
+    assert not existing.exists()
+    assert not new_report.exists()
+    assert target_artifact.exists()
+
+
+def test_complete_trace_validation_treats_desktop_report_as_supplemental() -> None:
+    trace = TraceObservation(
+        label="worktree/.shea/artifacts/halo/traces/candidate.jsonl",
+        sha256="a" * 64,
+        size_bytes=128,
+        span_count=2,
+        trace_count=1,
+        parented_span_count=1,
+        span_kinds=(
+            SpanKindCount(kind="AGENT", count=1),
+            SpanKindCount(kind="TOOL", count=1),
+        ),
+        service_version_span_count=2,
+        service_versions=("c" * 40,),
+    )
+
+    validation = TraceValidation(
+        checkpoint=ObservationCheckpoint(traces=(trace,)),
+        candidate_traces=(trace,),
+        halo_report_sha256="b" * 64,
+        halo_dataset_verified=True,
+        halo_revision_verified=True,
+        service_version_verified=True,
+        candidate_revision="c" * 40,
+        complete=True,
+    )
+
+    assert validation.complete
+    assert validation.candidate_desktop_reports == ()
 
 
 @pytest.mark.parametrize("kind", ["trace", "report"])

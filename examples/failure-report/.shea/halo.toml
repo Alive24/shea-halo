@@ -18,15 +18,19 @@ trusted_producers = ["Alive24"]
 [observation]
 trace_globs = [".shea/artifacts/halo/traces/*.jsonl"]
 desktop_report_globs = [".shea/artifacts/halo/desktop/**/report.md"]
-desktop_otlp_base_endpoint = "http://127.0.0.1:8799"
+catalyst_sdk_base_endpoint = "http://127.0.0.1:8799"
+require_candidate_traces = true
 
-[experiments]
+[setup]
 commands = [
   ["pnpm", "install", "--lockfile-only"],
-  ["pnpm", "build"],
-  ["pnpm", "check"],
-  ["pnpm", "test"],
-  ["pnpm", "format:check"],
+  ["pnpm", "install", "--frozen-lockfile"],
+]
+
+[experiments]
+external_blocker_exit_codes = [69]
+commands = [
+  ["pnpm", "run", "halo:trace-smoke"],
 ]
 
 [verification]

@@ -144,7 +144,7 @@ def test_halo_engine_environment_sets_and_restores_runtime_values(
         HaloConfig,
         SimpleNamespace(
             observation=SimpleNamespace(
-                desktop_otlp_base_endpoint="http://127.0.0.1:8799",
+                catalyst_sdk_base_endpoint="http://127.0.0.1:8799",
             )
         ),
     )
@@ -291,7 +291,7 @@ async def test_analysis_persists_only_sanitized_logical_artifacts(
             artifacts_dir=artifacts_dir,
             observation=SimpleNamespace(
                 trace_globs=(".shea/artifacts/halo/traces/*.jsonl",),
-                desktop_otlp_base_endpoint="http://127.0.0.1:8799",
+                catalyst_sdk_base_endpoint="http://127.0.0.1:8799",
             ),
         ),
     )

@@ -41,6 +41,7 @@ _SKIP_DIRECTORIES = {
 }
 INFERENCE_TRACE_CATALOG_URL = "https://docs.inference.net/llms.txt"
 MAX_MANIFEST_BYTES = 5 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
 
 
 class IntegrationError(RuntimeError):
@@ -191,11 +192,27 @@ def discover_dependencies(root: Path) -> dict[str, str]:
                         {str(name).lower(): str(version) for name, version in values.items()}
                     )
         elif manifest.name == "go.mod":
+            in_require_block = False
             for line in manifest.read_text(encoding="utf-8").splitlines():
                 stripped = line.strip()
-                if stripped and not stripped.startswith(("//", "module", "go", "require", ")")):
-                    name, _, version = stripped.partition(" ")
-                    dependencies[name.lower()] = version.strip()
+                if not stripped or stripped.startswith("//"):
+                    continue
+                if stripped == "require (":
+                    in_require_block = True
+                    continue
+                if stripped == ")" and in_require_block:
+                    in_require_block = False
+                    continue
+                requirement = (
+                    stripped.removeprefix("require ").strip()
+                    if stripped.startswith("require ")
+                    else stripped
+                    if in_require_block
+                    else ""
+                )
+                fields = requirement.split()
+                if len(fields) >= 2:
+                    dependencies[fields[0].lower()] = fields[1]
 
     return dict(sorted(dependencies.items()))
 
@@ -275,9 +292,15 @@ class IntegrationCatalog:
         )
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
-                return response.read().decode("utf-8")
+                content = response.read(MAX_DOCUMENT_BYTES + 1)
         except OSError as exc:
             raise IntegrationError(f"failed to fetch {url}: {exc}") from exc
+        if len(content) > MAX_DOCUMENT_BYTES:
+            raise IntegrationError(f"official tracing document exceeded {MAX_DOCUMENT_BYTES} bytes")
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise IntegrationError("official tracing document was not UTF-8") from exc
 
     def load(self) -> list[GuideRef]:
         self._ensure_directory(self.cache_dir)

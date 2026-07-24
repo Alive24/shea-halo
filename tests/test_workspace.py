@@ -174,6 +174,229 @@ def test_restored_workspace_rejects_unrecorded_dirty_state(
         )
 
 
+def test_discard_unpublished_attempt_restores_base_and_cleans_ignored_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    _ignore_attempt_artifacts(workspace)
+    readme = workspace.path / "README.md"
+    readme.write_text("attempted change\n", encoding="utf-8")
+    untracked = workspace.path / "attempt/output.txt"
+    untracked.parent.mkdir()
+    untracked.write_text("discard me\n", encoding="utf-8")
+    artifact = workspace.path / ".shea/artifacts/halo/traces/attempt.jsonl"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("{}\n", encoding="utf-8")
+    dependency = workspace.path / "node_modules/example/index.js"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("export {};\n", encoding="utf-8")
+    run(
+        workspace.path,
+        "git",
+        "add",
+        "--force",
+        ".shea/artifacts/halo/traces/attempt.jsonl",
+        "node_modules/example/index.js",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    (workspace.path / "attempt-link").symlink_to(outside, target_is_directory=True)
+    branch_before = run(workspace.path, "git", "branch", "--show-current")
+    remote_before = manager._remote_head(workspace.path, workspace.branch)
+
+    recovered = manager.discard_unpublished_attempt(
+        workspace,
+        issue_number=20,
+        persisted_base_revision=workspace.base_revision,
+        expected_snapshot=None,
+    )
+
+    assert recovered == workspace
+    assert readme.read_text(encoding="utf-8") == "# target\n"
+    assert not untracked.exists()
+    assert not (workspace.path / "attempt-link").exists()
+    assert not artifact.exists()
+    assert not dependency.exists()
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+    assert run(workspace.path, "git", "branch", "--show-current") == branch_before
+    assert manager._remote_head(workspace.path, workspace.branch) == remote_before
+    assert manager._snapshot_paths(workspace) == []
+
+
+def test_prepare_validation_workspace_removes_all_worktree_ignored_state_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    _ignore_attempt_artifacts(workspace)
+    target_artifact = manager.config.root / ".shea/artifacts/halo/traces/durable-target-trace.jsonl"
+    target_artifact.parent.mkdir(parents=True, exist_ok=True)
+    target_artifact.write_text('{"target":"durable"}\n', encoding="utf-8")
+    worktree_artifact = workspace.path / ".shea/artifacts/halo/traces/transient.jsonl"
+    worktree_artifact.parent.mkdir(parents=True)
+    worktree_artifact.write_text('{"worktree":"transient"}\n', encoding="utf-8")
+    dependency = workspace.path / "node_modules/example/index.js"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("export {};\n", encoding="utf-8")
+
+    prepared = manager.prepare_validation_workspace(
+        workspace,
+        issue_number=20,
+        persisted_base_revision=workspace.base_revision,
+        expected_snapshot=None,
+    )
+
+    assert prepared == workspace
+    assert not worktree_artifact.exists()
+    assert not dependency.exists()
+    assert target_artifact.read_text(encoding="utf-8") == '{"target":"durable"}\n'
+    assert manager._ignored_paths(workspace) == []
+
+
+def test_recover_abandoned_attempt_discards_unrecorded_attempt_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    _ignore_attempt_artifacts(workspace)
+    (workspace.path / "README.md").write_text("interrupted\n", encoding="utf-8")
+    untracked = workspace.path / "attempt.txt"
+    untracked.write_text("interrupted\n", encoding="utf-8")
+    ignored = workspace.path / "node_modules/example/index.js"
+    ignored.parent.mkdir(parents=True)
+    ignored.write_text("interrupted\n", encoding="utf-8")
+
+    recovered = manager.recover_abandoned_attempt(
+        issue_number=20,
+        persisted_branch=workspace.branch,
+        persisted_base_revision=workspace.base_revision,
+        expected_snapshot=None,
+    )
+
+    assert recovered == workspace
+    assert (workspace.path / "README.md").read_text(encoding="utf-8") == "# target\n"
+    assert not untracked.exists()
+    assert not ignored.exists()
+    assert manager._snapshot_paths(workspace) == []
+    assert manager._ignored_paths(workspace) == []
+
+
+def test_discard_unpublished_attempt_restores_persisted_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    candidate = workspace.path / "instrumentation.ts"
+    candidate.write_text("export {};\n", encoding="utf-8")
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+    assert intent is not None
+    snapshot = manager.publish_intent(
+        workspace,
+        intent,
+        issue_number=20,
+        title="Improve Eve tracing",
+        expected_snapshot=None,
+    )
+    candidate.write_text("attempted replacement\n", encoding="utf-8")
+    untracked = workspace.path / "attempt.txt"
+    untracked.write_text("discard me\n", encoding="utf-8")
+
+    recovered = manager.discard_unpublished_attempt(
+        workspace,
+        issue_number=20,
+        persisted_base_revision=workspace.base_revision,
+        expected_snapshot=snapshot,
+    )
+
+    assert recovered == workspace
+    assert candidate.read_text(encoding="utf-8") == "export {};\n"
+    assert not untracked.exists()
+    assert run(workspace.path, "git", "rev-parse", "HEAD") == snapshot.head_revision
+    assert manager._remote_head(workspace.path, workspace.branch) == snapshot.head_revision
+
+
+def test_discard_unpublished_attempt_rejects_wrong_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    tamper = workspace.path / "tamper.txt"
+    tamper.write_text("committed outside Halo\n", encoding="utf-8")
+    run(workspace.path, "git", "add", "tamper.txt")
+    run(workspace.path, "git", "commit", "-m", "external commit")
+    tampered_head = run(workspace.path, "git", "rev-parse", "HEAD")
+
+    with pytest.raises(WorkspaceError, match="HEAD differs from persisted state"):
+        manager.discard_unpublished_attempt(
+            workspace,
+            issue_number=20,
+            persisted_base_revision=workspace.base_revision,
+            expected_snapshot=None,
+        )
+
+    assert run(workspace.path, "git", "rev-parse", "HEAD") == tampered_head
+    assert tamper.read_text(encoding="utf-8") == "committed outside Halo\n"
+
+
+def test_discard_unpublished_attempt_rejects_non_managed_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    forged = HaloWorkspace(
+        path=outside,
+        branch=workspace.branch,
+        base_revision=workspace.base_revision,
+    )
+
+    with pytest.raises(WorkspaceError, match="does not match its Halo-owned path"):
+        manager.discard_unpublished_attempt(
+            forged,
+            issue_number=20,
+            persisted_base_revision=workspace.base_revision,
+            expected_snapshot=None,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_discard_unpublished_attempt_rejects_wrong_remote_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    candidate = workspace.path / "instrumentation.ts"
+    candidate.write_text("export {};\n", encoding="utf-8")
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+    assert intent is not None
+    snapshot = manager.publish_intent(
+        workspace,
+        intent,
+        issue_number=20,
+        title="Improve Eve tracing",
+        expected_snapshot=None,
+    )
+    candidate.write_text("unpublished attempt\n", encoding="utf-8")
+    run(
+        remote,
+        "git",
+        "update-ref",
+        f"refs/heads/{workspace.branch}",
+        workspace.base_revision,
+    )
+
+    with pytest.raises(WorkspaceError, match="remote Halo branch differs"):
+        manager.discard_unpublished_attempt(
+            workspace,
+            issue_number=20,
+            persisted_base_revision=workspace.base_revision,
+            expected_snapshot=snapshot,
+        )
+
+    assert candidate.read_text(encoding="utf-8") == "unpublished attempt\n"
+    assert run(workspace.path, "git", "rev-parse", "HEAD") == snapshot.head_revision
+
+
 def test_publication_intent_recovers_after_push_before_workpad_finalization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -328,6 +551,21 @@ def _prepared_workspace(
     run(workspace.path, "git", "config", "user.name", "Halo Test")
     run(workspace.path, "git", "config", "user.email", "halo@example.test")
     return remote, manager, workspace
+
+
+def _ignore_attempt_artifacts(workspace: HaloWorkspace) -> None:
+    exclude = Path(run(workspace.path, "git", "rev-parse", "--git-path", "info/exclude"))
+    if not exclude.is_absolute():
+        exclude = workspace.path / exclude
+    with exclude.open("a", encoding="utf-8") as output:
+        output.write("\n.shea/artifacts/\nnode_modules/\n")
+    assert run(
+        workspace.path,
+        "git",
+        "check-ignore",
+        ".shea/artifacts/halo/traces/attempt.jsonl",
+    )
+    assert run(workspace.path, "git", "check-ignore", "node_modules/example/index.js")
 
 
 @pytest.mark.parametrize(

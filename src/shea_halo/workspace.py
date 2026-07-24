@@ -23,6 +23,7 @@ from shea_halo.security import (
 )
 
 _SLUG_PART = re.compile(r"[a-z0-9]+")
+_GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 MAX_SNAPSHOT_FILE_BYTES = 10 * 1024 * 1024
 
 
@@ -106,6 +107,20 @@ class WorkspaceManager:
                 f"origin does not match configured repository {self.config.repository}"
             )
 
+    def current_base_revision(self) -> str:
+        self._validate_source()
+        self._run(
+            self.config.root,
+            ["git", "fetch", "--no-tags", "origin", self.config.base_branch],
+        )
+        revision = self._run(
+            self.config.root,
+            ["git", "rev-parse", f"origin/{self.config.base_branch}"],
+        ).stdout.strip()
+        if not _GIT_OBJECT_ID.fullmatch(revision):
+            raise WorkspaceError("configured base branch resolved to an invalid revision")
+        return revision
+
     def _worktree_path(self, issue_number: int, branch: str) -> Path:
         expected_prefix = f"halo/issue-{issue_number}-"
         if not branch.startswith(expected_prefix):
@@ -113,14 +128,14 @@ class WorkspaceManager:
         leaf = branch.removeprefix("halo/")
         leaf_path = Path(leaf)
         if leaf_path.name != leaf or ".." in leaf_path.parts:
-            raise WorkspaceError("diagnostic worktree path escapes its managed root")
+            raise WorkspaceError("Halo worktree path escapes its managed root")
         try:
             root = self.runtime.ensure_directory(self.config.worktrees_dir)
             candidate = self.runtime.path(root / leaf)
         except RuntimeFilesystemError:
             raise WorkspaceError("managed Halo worktrees root is unsafe") from None
         if candidate.parent != root:
-            raise WorkspaceError("diagnostic worktree path escapes its managed root")
+            raise WorkspaceError("Halo worktree path escapes its managed root")
         return candidate
 
     def _existing_worktree(self, path: Path) -> bool:
@@ -141,6 +156,254 @@ class WorkspaceManager:
             self.runtime.validate_directory(path)
         except (FileNotFoundError, RuntimeFilesystemError):
             raise WorkspaceError("Git did not create a safe managed Halo worktree") from None
+
+    def _git_common_directory(self, path: Path) -> Path:
+        raw = self._run(path, ["git", "rev-parse", "--git-common-dir"]).stdout.strip()
+        common = Path(raw)
+        if not common.is_absolute():
+            common = path / common
+        try:
+            return common.resolve(strict=True)
+        except OSError:
+            raise WorkspaceError(
+                "managed Halo worktree has an unavailable Git common dir"
+            ) from None
+
+    def _validate_attempt_recovery_state(
+        self,
+        workspace: HaloWorkspace,
+        *,
+        issue_number: int,
+        persisted_base_revision: str,
+        expected_snapshot: BranchSnapshot | None,
+        require_clean: bool,
+    ) -> tuple[Path, str]:
+        self._validate_source()
+        if not _GIT_OBJECT_ID.fullmatch(persisted_base_revision):
+            raise WorkspaceError("persisted Halo base revision is invalid")
+        if workspace.base_revision != persisted_base_revision:
+            raise WorkspaceError("managed Halo worktree base differs from persisted state")
+
+        expected_path = self._worktree_path(issue_number, workspace.branch)
+        try:
+            verified_path = self.runtime.validate_directory(expected_path)
+            supplied_path = workspace.path.resolve(strict=True)
+        except (FileNotFoundError, OSError, RuntimeFilesystemError):
+            raise WorkspaceError("managed Halo worktree path is unsafe") from None
+        if supplied_path != verified_path:
+            raise WorkspaceError("managed Halo worktree path does not match its Halo-owned path")
+
+        top = self._run(verified_path, ["git", "rev-parse", "--show-toplevel"]).stdout.strip()
+        if Path(top).resolve() != verified_path:
+            raise WorkspaceError("managed Halo worktree has unexpected Git identity")
+        if self._git_common_directory(verified_path) != self._git_common_directory(
+            self.config.root
+        ):
+            raise WorkspaceError("managed Halo worktree is not owned by the configured checkout")
+        current_branch = self._run(
+            verified_path,
+            ["git", "branch", "--show-current"],
+        ).stdout.strip()
+        if current_branch != workspace.branch:
+            raise WorkspaceError("managed Halo worktree has unexpected Git identity")
+
+        base_check = self._run(
+            verified_path,
+            ["git", "cat-file", "-e", f"{persisted_base_revision}^{{commit}}"],
+            check=False,
+        )
+        if base_check.returncode:
+            raise WorkspaceError("persisted Halo base revision is unavailable")
+
+        if expected_snapshot is None:
+            expected_head = persisted_base_revision
+            expected_remote_head = None
+        else:
+            if expected_snapshot.name != workspace.branch:
+                raise WorkspaceError("workpad snapshot branch does not match the managed worktree")
+            if not _GIT_OBJECT_ID.fullmatch(expected_snapshot.head_revision):
+                raise WorkspaceError("workpad snapshot revision is invalid")
+            expected_head = expected_snapshot.head_revision
+            expected_remote_head = expected_snapshot.head_revision
+
+        ancestor = self._run(
+            verified_path,
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                persisted_base_revision,
+                expected_head,
+            ],
+            check=False,
+        )
+        if ancestor.returncode != 0:
+            raise WorkspaceError("persisted Halo base revision is not an ancestor of snapshot HEAD")
+        head = self._run(verified_path, ["git", "rev-parse", "HEAD"]).stdout.strip()
+        if head != expected_head:
+            raise WorkspaceError("managed Halo worktree HEAD differs from persisted state")
+        if self._remote_head(verified_path, workspace.branch) != expected_remote_head:
+            raise WorkspaceError("remote Halo branch differs from persisted snapshot")
+        if require_clean and (self._snapshot_paths(workspace) or self._ignored_paths(workspace)):
+            raise WorkspaceError("managed Halo worktree remained dirty after attempt recovery")
+        return verified_path, expected_head
+
+    def _ignored_paths(self, workspace: HaloWorkspace) -> list[str]:
+        ignored = self._run(
+            workspace.path,
+            [
+                "git",
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ],
+        )
+        return sorted(path for path in ignored.stdout.split("\0") if path)
+
+    def _clean_ignored_paths(self, workspace: HaloWorkspace) -> None:
+        """Remove every ignored path from the experiment worktree."""
+
+        self._run(
+            workspace.path,
+            [
+                "git",
+                "clean",
+                "--force",
+                "--force",
+                "-d",
+                "-X",
+                "--",
+            ],
+        )
+        remaining = self._ignored_paths(workspace)
+        if remaining:
+            raise WorkspaceError(
+                f"ignored state remained in the validation worktree: {redact_text(remaining[0])}"
+            )
+
+    def discard_unpublished_attempt(
+        self,
+        workspace: HaloWorkspace,
+        *,
+        issue_number: int,
+        persisted_base_revision: str,
+        expected_snapshot: BranchSnapshot | None,
+    ) -> HaloWorkspace:
+        """Discard one failed attempt without changing durable Git state.
+
+        This primitive applies only to the exact Halo-owned managed worktree
+        represented by persisted state. It resets tracked state to the
+        persisted base or snapshot HEAD, removes non-ignored untracked paths,
+        and removes all ignored state in that worktree. Target-owned durable
+        Halo artifacts live in the observed checkout; worktree dependencies
+        and observations are rebuilt by setup and experiments.
+        """
+
+        path, expected_head = self._validate_attempt_recovery_state(
+            workspace,
+            issue_number=issue_number,
+            persisted_base_revision=persisted_base_revision,
+            expected_snapshot=expected_snapshot,
+            require_clean=False,
+        )
+        self._run(
+            path,
+            [
+                "git",
+                "restore",
+                f"--source={expected_head}",
+                "--staged",
+                "--",
+                ".",
+            ],
+        )
+        self._run(
+            path,
+            [
+                "git",
+                "restore",
+                f"--source={expected_head}",
+                "--worktree",
+                "--",
+                ".",
+            ],
+        )
+        self._run(path, ["git", "clean", "--force", "-d", "--"])
+        self._clean_ignored_paths(workspace)
+        recovered_path, _ = self._validate_attempt_recovery_state(
+            workspace,
+            issue_number=issue_number,
+            persisted_base_revision=persisted_base_revision,
+            expected_snapshot=expected_snapshot,
+            require_clean=True,
+        )
+        return HaloWorkspace(
+            path=recovered_path,
+            branch=workspace.branch,
+            base_revision=persisted_base_revision,
+        )
+
+    def recover_abandoned_attempt(
+        self,
+        *,
+        issue_number: int,
+        persisted_branch: str,
+        persisted_base_revision: str,
+        expected_snapshot: BranchSnapshot | None,
+    ) -> HaloWorkspace:
+        """Recover a kill-interrupted attempt that never reached publication intent."""
+
+        workspace = HaloWorkspace(
+            path=self._worktree_path(issue_number, persisted_branch),
+            branch=persisted_branch,
+            base_revision=persisted_base_revision,
+        )
+        return self.discard_unpublished_attempt(
+            workspace,
+            issue_number=issue_number,
+            persisted_base_revision=persisted_base_revision,
+            expected_snapshot=expected_snapshot,
+        )
+
+    def prepare_validation_workspace(
+        self,
+        workspace: HaloWorkspace,
+        *,
+        issue_number: int,
+        persisted_base_revision: str,
+        expected_snapshot: BranchSnapshot | None,
+    ) -> HaloWorkspace:
+        """Make candidate validation depend only on the published Git snapshot.
+
+        Tracked and non-ignored state must already be clean. Every ignored
+        worktree path, including worktree-local `.shea`, is discarded before
+        target-owned setup and experiments rebuild their exact inputs.
+        """
+
+        path, _ = self._validate_attempt_recovery_state(
+            workspace,
+            issue_number=issue_number,
+            persisted_base_revision=persisted_base_revision,
+            expected_snapshot=expected_snapshot,
+            require_clean=False,
+        )
+        if self._snapshot_paths(workspace):
+            raise WorkspaceError("candidate validation cannot start with unrecorded source changes")
+        self._clean_ignored_paths(workspace)
+        verified_path, _ = self._validate_attempt_recovery_state(
+            workspace,
+            issue_number=issue_number,
+            persisted_base_revision=persisted_base_revision,
+            expected_snapshot=expected_snapshot,
+            require_clean=True,
+        )
+        return HaloWorkspace(
+            path=verified_path,
+            branch=workspace.branch,
+            base_revision=persisted_base_revision,
+        )
 
     def prepare(
         self,
@@ -165,14 +428,7 @@ class WorkspaceManager:
         path = self._worktree_path(issue_number, branch)
         path_exists = self._existing_worktree(path)
 
-        self._run(
-            self.config.root,
-            ["git", "fetch", "--no-tags", "origin", self.config.base_branch],
-        )
-        base_revision = self._run(
-            self.config.root,
-            ["git", "rev-parse", f"origin/{self.config.base_branch}"],
-        ).stdout.strip()
+        base_revision = self.current_base_revision()
 
         if path_exists:
             if not allow_existing:

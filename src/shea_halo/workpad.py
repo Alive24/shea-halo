@@ -44,13 +44,13 @@ def _parse_comment(comment: IssueComment) -> WorkpadEntry | None:
         raise WorkpadError(f"invalid Halo workpad comment {comment.database_id}") from exc
 
 
-def find_head(
+def _trusted_entries(
     comments: list[IssueComment],
     *,
     repository: str,
     issue_number: int,
     trusted_producers: Collection[str],
-) -> WorkpadHead | None:
+) -> dict[int, WorkpadEntry]:
     trusted = {producer.casefold() for producer in trusted_producers if producer.strip()}
     if not trusted:
         raise WorkpadError("Halo workpad requires at least one trusted producer")
@@ -82,9 +82,24 @@ def find_head(
                 f"Halo workpad comment {comment.database_id} has an untrusted producer"
             )
         entries[comment.database_id] = entry
+    return entries
 
+
+def _validated_history(
+    comments: list[IssueComment],
+    *,
+    repository: str,
+    issue_number: int,
+    trusted_producers: Collection[str],
+) -> tuple[dict[int, WorkpadEntry], int | None]:
+    entries = _trusted_entries(
+        comments,
+        repository=repository,
+        issue_number=issue_number,
+        trusted_producers=trusted_producers,
+    )
     if not entries:
-        return None
+        return entries, None
 
     successors: dict[int, list[int]] = {}
     for comment_id, entry in entries.items():
@@ -125,6 +140,47 @@ def find_head(
     head = entries[head_id]
     if head.revision != len(entries):
         raise WorkpadError("Halo workpad revision does not match its immutable history")
+    return entries, head_id
+
+
+def trusted_workpad_comment_ids(
+    comments: list[IssueComment],
+    *,
+    repository: str,
+    issue_number: int,
+    trusted_producers: Collection[str],
+) -> frozenset[int]:
+    """Return IDs belonging to the one validated trusted workpad history.
+
+    Marker-like comments from other authors are deliberately omitted rather
+    than parsed, so callers can retain them as ordinary Issue discussion.
+    """
+
+    entries, _ = _validated_history(
+        comments,
+        repository=repository,
+        issue_number=issue_number,
+        trusted_producers=trusted_producers,
+    )
+    return frozenset(entries)
+
+
+def find_head(
+    comments: list[IssueComment],
+    *,
+    repository: str,
+    issue_number: int,
+    trusted_producers: Collection[str],
+) -> WorkpadHead | None:
+    entries, head_id = _validated_history(
+        comments,
+        repository=repository,
+        issue_number=issue_number,
+        trusted_producers=trusted_producers,
+    )
+    if head_id is None:
+        return None
+    head = entries[head_id]
     return WorkpadHead(comment_id=head_id, entry=head)
 
 

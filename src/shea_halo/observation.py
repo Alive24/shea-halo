@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from shea_halo.config import HaloConfig
+from shea_halo.runtime_fs import RuntimeFilesystem, RuntimeFilesystemError
 
 if TYPE_CHECKING:
     from shea_halo.workspace import HaloWorkspace
@@ -72,6 +73,8 @@ class TraceObservation(FileObservation):
     trace_count: int = Field(gt=0)
     parented_span_count: int = Field(ge=0)
     span_kinds: tuple[SpanKindCount, ...]
+    service_version_span_count: int = Field(default=0, ge=0)
+    service_versions: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def _consistent_summary(self) -> TraceObservation:
@@ -79,11 +82,19 @@ class TraceObservation(FileObservation):
             raise ValueError("trace_count cannot exceed span_count")
         if self.parented_span_count > self.span_count:
             raise ValueError("parented_span_count cannot exceed span_count")
+        if self.service_version_span_count > self.span_count:
+            raise ValueError("service_version_span_count cannot exceed span_count")
         if not self.span_kinds or sum(item.count for item in self.span_kinds) != self.span_count:
             raise ValueError("span_kinds must account for every span")
         kinds = tuple(item.kind for item in self.span_kinds)
         if kinds != tuple(sorted(set(kinds))):
             raise ValueError("span_kinds must be unique and sorted")
+        if self.service_versions != tuple(sorted(set(self.service_versions))):
+            raise ValueError("service_versions must be unique and sorted")
+        if bool(self.service_version_span_count) != bool(self.service_versions):
+            raise ValueError(
+                "service_version_span_count and service_versions must both be present or absent"
+            )
         return self
 
 
@@ -156,6 +167,8 @@ class TraceValidation(_FrozenModel):
     candidate_desktop_reports: tuple[FileObservation, ...] = ()
     halo_report_sha256: str | None = None
     halo_dataset_verified: bool = False
+    halo_revision_verified: bool = False
+    service_version_verified: bool = False
     candidate_revision: str | None = None
     complete: bool = False
     validated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -173,15 +186,20 @@ class TraceValidation(_FrozenModel):
             return self
         if (
             not self.candidate_traces
-            or not self.candidate_desktop_reports
             or self.halo_report_sha256 is None
             or not self.halo_dataset_verified
+            or not self.halo_revision_verified
+            or not self.service_version_verified
             or self.candidate_revision is None
             or not any(trace.parented_span_count > 0 for trace in self.candidate_traces)
+            or any(
+                trace.service_version_span_count != trace.span_count
+                for trace in self.candidate_traces
+            )
         ):
             raise ValueError(
-                "complete trace validation requires a candidate hierarchy, Desktop report, "
-                "HALO analysis, and candidate revision"
+                "complete trace validation requires a candidate hierarchy, HALO analysis, "
+                "candidate revision, and matching trace service.version"
             )
         return self
 
@@ -217,6 +235,53 @@ def inventory_observations(
             _inventory_file(path, label) for label, path in sorted(report_candidates.items())
         ),
     )
+
+
+def discard_worktree_observation_changes(
+    config: HaloConfig,
+    workspace: HaloWorkspace,
+    baseline: ObservationCheckpoint,
+) -> tuple[str, ...]:
+    """Remove only changed validation artifacts below the worktree's managed `.shea`.
+
+    This recovery path deliberately hashes files without parsing them so a partial
+    or malformed trace cannot strand the next research re-entry.
+    """
+
+    root = workspace.path.resolve(strict=True)
+    roots = (_ObservationRoot(scope="worktree", path=root),)
+    candidates = {
+        **_discover(roots, config.observation.trace_globs, category="trace"),
+        **_discover(
+            roots,
+            config.observation.desktop_report_globs,
+            category="desktop report",
+        ),
+    }
+    baseline_digests = {
+        item.label: item.sha256 for item in (*baseline.traces, *baseline.desktop_reports)
+    }
+    changed: list[tuple[str, Path]] = []
+    for label, path in sorted(candidates.items()):
+        current = _inventory_file(path, label)
+        if baseline_digests.get(label) == current.sha256:
+            continue
+        relative = path.relative_to(root)
+        if not relative.parts or relative.parts[0] != ".shea":
+            raise ObservationError(
+                "changed validation observation outside worktree/.shea requires manual cleanup"
+            )
+        changed.append((label, path))
+
+    try:
+        runtime = RuntimeFilesystem(root)
+        for _, path in changed:
+            runtime.remove_file(path)
+    except RuntimeFilesystemError:
+        raise ObservationError(
+            "changed validation observation could not be discarded safely"
+        ) from None
+    return tuple(label for label, _ in changed)
 
 
 def diff_observation_checkpoints(
@@ -385,6 +450,8 @@ def _inventory_trace(path: Path, label: str) -> TraceObservation:
     span_ids: set[tuple[str, str]] = set()
     parent_links: dict[tuple[str, str], tuple[str, str]] = {}
     span_kinds: Counter[str] = Counter()
+    service_versions: set[str] = set()
+    service_version_span_count = 0
 
     source, before = _open_stable(path, label)
     try:
@@ -442,6 +509,10 @@ def _inventory_trace(path: Path, label: str) -> TraceObservation:
                 else span.kind.strip().upper()
             )
             span_kinds[kind] += 1
+            service_version = span.resource.attributes.get("service.version")
+            if isinstance(service_version, str) and service_version.strip():
+                service_versions.add(service_version.strip())
+                service_version_span_count += 1
         _assert_stable(source, before, bytes_read, label)
     finally:
         source.close()
@@ -469,4 +540,6 @@ def _inventory_trace(path: Path, label: str) -> TraceObservation:
         span_kinds=tuple(
             SpanKindCount(kind=kind, count=count) for kind, count in sorted(span_kinds.items())
         ),
+        service_version_span_count=service_version_span_count,
+        service_versions=tuple(sorted(service_versions)),
     )

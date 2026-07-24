@@ -102,6 +102,61 @@ def test_issue_research_lease_accepts_only_the_same_current_project_item(
         client.assert_issue_remains_in_research(issue)
 
 
+def test_project_issue_inventory_includes_terminal_states_for_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client()
+
+    def node(number: int, status: str) -> dict[str, object]:
+        return {
+            "id": f"item-{number}",
+            "fieldValueByName": {"name": status},
+            "content": {
+                "number": number,
+                "title": f"Issue {number}",
+                "body": "",
+                "url": f"https://github.com/Alive24/FailureReport/issues/{number}",
+                "repository": {"nameWithOwner": "Alive24/FailureReport"},
+            },
+        }
+
+    monkeypatch.setattr(
+        client,
+        "_json",
+        lambda _args: {
+            "data": {
+                "user": {
+                    "projectV2": {
+                        "id": "project",
+                        "items": {
+                            "nodes": [
+                                node(1, "Halo Research"),
+                                node(2, "Todo"),
+                                node(3, "Done"),
+                                node(4, "Need Human Input"),
+                                node(5, "Agent Review"),
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        },
+                    }
+                }
+            }
+        },
+    )
+
+    all_items = client.list_project_issues()
+    research_items = client.list_research_issues()
+
+    assert [(item.number, item.status) for item in all_items] == [
+        (1, "Halo Research"),
+        (2, "Todo"),
+        (3, "Done"),
+        (4, "Need Human Input"),
+        (5, "Agent Review"),
+    ]
+    assert [(item.number, item.status) for item in research_items] == [(1, "Halo Research")]
+
+
 def test_branch_pull_requests_returns_all_same_repository_matches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -139,17 +194,13 @@ def test_branch_pull_requests_returns_all_same_repository_matches(
         )
         return {
             "data": {
-                "repository": {
-                    "ref": {
-                        "name": "halo/issue-26-tracing",
-                        "associatedPullRequests": {
-                            "nodes": nodes,
-                            "pageInfo": {
-                                "hasNextPage": after is None,
-                                "endCursor": "cursor-2" if after is None else None,
-                            },
-                        },
-                    }
+                "search": {
+                    "issueCount": 2,
+                    "nodes": nodes,
+                    "pageInfo": {
+                        "hasNextPage": after is None,
+                        "endCursor": "cursor-2" if after is None else None,
+                    },
                 }
             }
         }
@@ -168,7 +219,7 @@ def test_branch_pull_requests_returns_all_same_repository_matches(
         (39, "closed", True),
     ]
     assert len(captured_calls) == 2
-    assert "qualifiedName=refs/heads/halo/issue-26-tracing" in captured_calls[0]
+    assert "searchQuery=is:pr head:halo/issue-26-tracing" in captured_calls[0]
     assert "after=cursor-2" in captured_calls[1]
 
 
@@ -181,14 +232,10 @@ def test_assert_branch_has_no_pull_requests_returns_empty_structured_check(
         "_json",
         lambda _args: {
             "data": {
-                "repository": {
-                    "ref": {
-                        "name": "halo/issue-26-tracing",
-                        "associatedPullRequests": {
-                            "nodes": [],
-                            "pageInfo": {"hasNextPage": False, "endCursor": None},
-                        },
-                    }
+                "search": {
+                    "issueCount": 0,
+                    "nodes": [],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
                 }
             }
         },
@@ -202,7 +249,7 @@ def test_assert_branch_has_no_pull_requests_returns_empty_structured_check(
     assert check.pull_requests == ()
 
 
-def test_assert_branch_has_no_pull_requests_rejects_closed_history(
+def test_assert_branch_has_no_pull_requests_rejects_deleted_ref_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _client()
@@ -211,23 +258,19 @@ def test_assert_branch_has_no_pull_requests_rejects_closed_history(
         "_json",
         lambda _args: {
             "data": {
-                "repository": {
-                    "ref": {
-                        "name": "halo/issue-26-tracing",
-                        "associatedPullRequests": {
-                            "nodes": [
-                                {
-                                    "number": 39,
-                                    "url": "https://github.com/upstream/project/pull/39",
-                                    "state": "CLOSED",
-                                    "mergedAt": None,
-                                    "headRefName": "halo/issue-26-tracing",
-                                    "headRepository": {"nameWithOwner": "Alive24/FailureReport"},
-                                }
-                            ],
-                            "pageInfo": {"hasNextPage": False, "endCursor": None},
-                        },
-                    }
+                "search": {
+                    "issueCount": 1,
+                    "nodes": [
+                        {
+                            "number": 39,
+                            "url": "https://github.com/upstream/project/pull/39",
+                            "state": "CLOSED",
+                            "mergedAt": None,
+                            "headRefName": "halo/issue-26-tracing",
+                            "headRepository": {"nameWithOwner": "Alive24/FailureReport"},
+                        }
+                    ],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
                 }
             }
         },
@@ -244,32 +287,10 @@ def test_assert_branch_has_no_pull_requests_rejects_closed_history(
     "response",
     [
         {},
-        {"data": {"repository": {"ref": {"name": "halo/issue-26-tracing"}}}},
-        {
-            "data": {
-                "repository": {
-                    "ref": {
-                        "name": "halo/issue-26-tracing",
-                        "associatedPullRequests": {
-                            "nodes": [
-                                {
-                                    "number": 1,
-                                    "url": "https://github.com/upstream/project/pull/1",
-                                    "state": "OPEN",
-                                    "mergedAt": None,
-                                    "headRefName": "halo/issue-26-tracing",
-                                    "headRepository": {"nameWithOwner": "attacker/fork"},
-                                }
-                            ],
-                            "pageInfo": {"hasNextPage": False, "endCursor": None},
-                        },
-                    },
-                }
-            }
-        },
+        {"data": {"search": {}}},
     ],
 )
-def test_branch_pull_request_lookup_fails_closed_on_untrusted_response(
+def test_branch_pull_request_lookup_fails_closed_on_malformed_response(
     monkeypatch: pytest.MonkeyPatch,
     response: object,
 ) -> None:
@@ -277,6 +298,132 @@ def test_branch_pull_request_lookup_fails_closed_on_untrusted_response(
     monkeypatch.setattr(client, "_json", lambda _args: response)
 
     with pytest.raises(GitHubError):
+        client.branch_pull_requests(
+            "Alive24/FailureReport",
+            "halo/issue-26-tracing",
+        )
+
+
+def test_branch_pull_request_lookup_ignores_same_branch_from_another_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client()
+    monkeypatch.setattr(
+        client,
+        "_json",
+        lambda _args: {
+            "data": {
+                "search": {
+                    "issueCount": 1,
+                    "nodes": [
+                        {
+                            "number": 1,
+                            "url": "https://github.com/attacker/fork/pull/1",
+                            "state": "OPEN",
+                            "mergedAt": None,
+                            "headRefName": "halo/issue-26-tracing",
+                            "headRepository": {"nameWithOwner": "attacker/fork"},
+                        }
+                    ],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }
+            }
+        },
+    )
+
+    check = client.branch_pull_requests(
+        "Alive24/FailureReport",
+        "halo/issue-26-tracing",
+    )
+
+    assert check.pull_requests == ()
+
+
+def test_branch_pull_request_lookup_fails_closed_above_search_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client()
+    monkeypatch.setattr(
+        client,
+        "_json",
+        lambda _args: {
+            "data": {
+                "search": {
+                    "issueCount": 1_001,
+                    "nodes": [],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }
+            }
+        },
+    )
+
+    with pytest.raises(GitHubError, match="complete search window"):
+        client.branch_pull_requests(
+            "Alive24/FailureReport",
+            "halo/issue-26-tracing",
+        )
+
+
+def test_branch_pull_request_lookup_rejects_truncated_search_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client()
+    monkeypatch.setattr(
+        client,
+        "_json",
+        lambda _args: {
+            "data": {
+                "search": {
+                    "issueCount": 1,
+                    "nodes": [],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }
+            }
+        },
+    )
+
+    with pytest.raises(GitHubError, match="search was incomplete"):
+        client.branch_pull_requests(
+            "Alive24/FailureReport",
+            "halo/issue-26-tracing",
+        )
+
+
+def test_branch_pull_request_lookup_rejects_count_change_during_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client()
+    calls = 0
+
+    def response(_args: list[str]) -> object:
+        nonlocal calls
+        calls += 1
+        count = 2 if calls == 1 else 3
+        return {
+            "data": {
+                "search": {
+                    "issueCount": count,
+                    "nodes": [
+                        {
+                            "number": calls,
+                            "url": f"https://github.com/upstream/project/pull/{calls}",
+                            "state": "OPEN",
+                            "mergedAt": None,
+                            "headRefName": "halo/issue-26-tracing",
+                            "headRepository": {"nameWithOwner": "Alive24/FailureReport"},
+                        }
+                    ],
+                    "pageInfo": {
+                        "hasNextPage": calls == 1,
+                        "endCursor": "next" if calls == 1 else None,
+                    },
+                }
+            }
+        }
+
+    monkeypatch.setattr(client, "_json", response)
+
+    with pytest.raises(GitHubError, match="changed during pagination"):
         client.branch_pull_requests(
             "Alive24/FailureReport",
             "halo/issue-26-tracing",

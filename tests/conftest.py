@@ -35,6 +35,9 @@ project_number = 10
 [observation]
 trace_globs = [".shea/artifacts/halo/traces/*.jsonl"]
 
+[setup]
+commands = [["python", "-m", "pip", "--version"]]
+
 [experiments]
 commands = [["python", "-m", "pytest"]]
 
