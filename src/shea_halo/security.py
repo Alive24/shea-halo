@@ -117,12 +117,12 @@ _PLACEHOLDER_VALUES = {
     "undefined",
 }
 _POSIX_HOST_PATH = re.compile(
-    r"(?<![A-Za-z0-9+.-]:)(?<![A-Za-z0-9_./>\]-])"
+    r"(?<![A-Za-z0-9+.-]:)(?<![A-Za-z0-9_./+=>\]-])"
     r"(?:"
     r"/(?:Users|home|Volumes|private|tmp|var|opt|etc|usr|Library|root|mnt|srv|"
     r"workspace|Applications|System|nix|data|code|app|project|builds)"
-    r"(?:/[^\s\\\"'<>`|,;)\]}]*)?"
-    r"|/(?:[^\s/\\\"'<>`|,;)\]}]+/){2,}[^\s/\\\"'<>`|,;)\]}]*"
+    r"(?:/[^\s\\=\"'<>`|,;)\]}+]*)?"
+    r"|/(?:[^\s/\\=\"'<>`|,;)\]}+]+/){2,}[^\s/\\=\"'<>`|,;)\]}+]*"
     r")"
 )
 _WINDOWS_HOST_PATH = re.compile(

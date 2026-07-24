@@ -175,10 +175,18 @@ def test_structured_persistence_sanitizes_keys_values_and_paths(tmp_path: Path) 
 
 
 def test_redact_host_paths_keeps_repository_relative_paths() -> None:
-    text = """\
-Inspect src/shea_halo/agent.py and docs/tracing.md.
-const endpoint = base.replace(/\\/$/, "") + "/v1/traces";
-"""
+    text = "\n".join(
+        [
+            "Inspect src/shea_halo/agent.py and docs/tracing.md.",
+            'const endpoint = base.replace(/\\/$/, "") + "/v1/traces";',
+            (
+                "integrity: sha512-4+/OFSqOjoyULo7eN7EA97DE0Xydj/"
+                "PW5aIckxqQIoFjFwqXKuFCvXUJObyJfBF9Khu4RL/"
+                "jlDRI9FPaMGfPnw=="
+            ),
+            "",
+        ]
+    )
 
     assert redact_host_paths(text) == text
     assert not contains_host_absolute_path(text)

@@ -689,7 +689,18 @@ def test_snapshot_accepts_javascript_url_normalization_regex(
 ) -> None:
     _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
     (workspace.path / "tracing.mjs").write_text(
-        'const endpoint = base.replace(/\\/$/, "") + "/v1/traces";\n',
+        "\n".join(
+            [
+                'const endpoint = base.replace(/\\/$/, "") + "/v1/traces";',
+                (
+                    "const integrity = "
+                    '"sha512-4+/OFSqOjoyULo7eN7EA97DE0Xydj/'
+                    "PW5aIckxqQIoFjFwqXKuFCvXUJObyJfBF9Khu4RL/"
+                    'jlDRI9FPaMGfPnw==";'
+                ),
+                "",
+            ]
+        ),
         encoding="utf-8",
     )
 
