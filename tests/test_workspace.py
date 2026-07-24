@@ -683,6 +683,22 @@ def test_snapshot_rejects_host_absolute_paths(
         manager.create_publication_intent(workspace, expected_snapshot=None)
 
 
+def test_snapshot_accepts_javascript_url_normalization_regex(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    (workspace.path / "tracing.mjs").write_text(
+        'const endpoint = base.replace(/\\/$/, "") + "/v1/traces";\n',
+        encoding="utf-8",
+    )
+
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+
+    assert intent is not None
+    assert [path.path for path in intent.paths] == ["tracing.mjs"]
+
+
 def test_snapshot_rejects_large_files_before_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
