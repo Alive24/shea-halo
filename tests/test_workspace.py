@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,123 @@ def test_semantic_branch_name_is_stable_and_readable() -> None:
     ).endswith("native")
 
 
+def test_source_validation_rejects_a_separate_origin_push_url(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    run(source, "git", "init")
+    run(
+        source,
+        "git",
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/Alive24/FailureReport.git",
+    )
+    write_target_config(source)
+    manager = WorkspaceManager(HaloConfig.load(source))
+
+    assert manager._validate_source() == "https://github.com/Alive24/FailureReport.git"
+
+    run(
+        source,
+        "git",
+        "remote",
+        "set-url",
+        "--add",
+        "--push",
+        "origin",
+        "https://github.com/Alive24/another-repository.git",
+    )
+    with pytest.raises(WorkspaceError, match="configured repository"):
+        manager._validate_source()
+
+
+def test_source_validation_rejects_a_remote_named_like_the_push_url(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    run(source, "git", "init")
+    canonical_url = "https://github.com/Alive24/FailureReport.git"
+    run(source, "git", "remote", "add", "origin", canonical_url)
+    write_target_config(source)
+    manager = WorkspaceManager(HaloConfig.load(source))
+    run(
+        source,
+        "git",
+        "config",
+        f"remote.{canonical_url}.url",
+        "https://github.com/Alive24/another-repository.git",
+    )
+
+    with pytest.raises(WorkspaceError, match="conflicts with a configured remote name"):
+        manager._validate_source()
+
+
+def test_workspace_validation_rejects_a_worktree_specific_url_rewrite(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    run(source, "git", "init")
+    run(source, "git", "config", "user.name", "Halo Test")
+    run(source, "git", "config", "user.email", "halo@example.test")
+    (source / "README.md").write_text("# target\n", encoding="utf-8")
+    run(source, "git", "add", "README.md")
+    run(source, "git", "commit", "-m", "initial")
+    canonical_url = "https://github.com/Alive24/FailureReport.git"
+    rewritten_url = "https://github.com/Alive24/another-repository.git"
+    run(source, "git", "remote", "add", "origin", canonical_url)
+    worktree = tmp_path / "managed-worktree"
+    run(source, "git", "worktree", "add", "-b", "halo-test", str(worktree))
+    run(source, "git", "config", "extensions.worktreeConfig", "true")
+    run(
+        worktree,
+        "git",
+        "config",
+        "--worktree",
+        f"url.{rewritten_url}.insteadOf",
+        canonical_url,
+    )
+    write_target_config(source)
+    manager = WorkspaceManager(HaloConfig.load(source))
+
+    assert manager._validate_source() == canonical_url
+    with pytest.raises(WorkspaceError, match="configured repository"):
+        manager._validated_origin_push_url(worktree)
+
+
+def test_source_validation_rejects_a_second_url_rewrite_pass(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    run(source, "git", "init")
+    canonical_url = "https://github.com/Alive24/FailureReport.git"
+    run(source, "git", "remote", "add", "origin", "halo-source")
+    run(
+        source,
+        "git",
+        "config",
+        f"url.{canonical_url}.insteadOf",
+        "halo-source",
+    )
+    run(
+        source,
+        "git",
+        "config",
+        "url.file:///private/tmp/attacker.git.insteadOf",
+        canonical_url,
+    )
+    write_target_config(source)
+    manager = WorkspaceManager(HaloConfig.load(source))
+
+    with pytest.raises(WorkspaceError, match="subject to another Git URL rewrite"):
+        manager._validate_source()
+
+
 def test_managed_worktree_commit_and_push(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     remote = tmp_path / "remote.git"
     source = tmp_path / "source"
@@ -46,7 +164,12 @@ def test_managed_worktree_commit_and_push(tmp_path: Path, monkeypatch: pytest.Mo
     write_target_config(source)
     config = HaloConfig.load(source)
     manager = WorkspaceManager(config)
-    monkeypatch.setattr(manager, "_validate_source", lambda: None)
+    monkeypatch.setattr(manager, "_validate_source", lambda: str(remote))
+    monkeypatch.setattr(
+        manager,
+        "_validated_origin_push_url",
+        lambda _path: str(remote),
+    )
 
     workspace = manager.prepare(
         issue_number=20,
@@ -54,6 +177,13 @@ def test_managed_worktree_commit_and_push(tmp_path: Path, monkeypatch: pytest.Mo
     )
     run(workspace.path, "git", "config", "user.name", "Halo Test")
     run(workspace.path, "git", "config", "user.email", "halo@example.test")
+    run(
+        workspace.path,
+        "git",
+        "config",
+        "user.name",
+        "api_token=literal-production-secret",
+    )
     (workspace.path / "instrumentation.ts").write_text("export {};\n", encoding="utf-8")
 
     intent = manager.create_publication_intent(workspace, expected_snapshot=None)
@@ -71,6 +201,19 @@ def test_managed_worktree_commit_and_push(tmp_path: Path, monkeypatch: pytest.Mo
         run(remote, "git", "rev-parse", "refs/heads/halo/issue-20-improve-eve-tracing")
         == snapshot.head_revision
     )
+    assert run(
+        workspace.path,
+        "git",
+        "show",
+        "-s",
+        "--format=%an%n%ae%n%cn%n%ce",
+        snapshot.head_revision,
+    ).splitlines() == [
+        "Shea Halo",
+        "shea-halo@users.noreply.github.com",
+        "Shea Halo",
+        "shea-halo@users.noreply.github.com",
+    ]
 
     restored = manager.prepare(
         issue_number=20,
@@ -486,6 +629,416 @@ def test_publication_revalidates_commit_after_pre_commit_hook(
     )
 
 
+def test_publication_rejects_commit_message_hook_rewrites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    candidate = workspace.path / "instrumentation.ts"
+    candidate.write_text("export {};\n", encoding="utf-8")
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+    assert intent is not None
+    hook = Path(run(workspace.path, "git", "rev-parse", "--git-path", "hooks/commit-msg"))
+    if not hook.is_absolute():
+        hook = workspace.path / hook
+    hook.write_text(
+        "#!/bin/sh\nprintf 'api_token=literal-production-secret\\n' > \"$1\"\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    with pytest.raises(WorkspaceError, match="unsafe Git commit metadata"):
+        manager.publish_intent(
+            workspace,
+            intent,
+            issue_number=20,
+            title="Improve Eve tracing",
+            expected_snapshot=None,
+        )
+
+    assert (
+        manager._run(
+            workspace.path,
+            ["git", "ls-remote", "--heads", "origin", workspace.branch],
+        ).stdout
+        == ""
+    )
+
+
+@pytest.mark.parametrize(
+    "hook_command",
+    [
+        "git remote set-url origin",
+        "git remote set-url --add --push origin",
+    ],
+)
+def test_publication_rejects_origin_retargeting_from_a_commit_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_command: str,
+) -> None:
+    remote, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    attacker = tmp_path / "attacker.git"
+    run(tmp_path, "git", "init", "--bare", str(attacker))
+
+    def validate_local_origin() -> str:
+        expected = str(remote)
+        fetch_urls = manager._run(
+            manager.config.root,
+            ["git", "remote", "get-url", "--all", "origin"],
+        ).stdout.splitlines()
+        push_urls = manager._run(
+            manager.config.root,
+            ["git", "remote", "get-url", "--push", "--all", "origin"],
+        ).stdout.splitlines()
+        if fetch_urls != [expected] or push_urls != [expected]:
+            raise WorkspaceError("origin does not match the configured repository")
+        return expected
+
+    monkeypatch.setattr(manager, "_validate_source", validate_local_origin)
+    candidate = workspace.path / "instrumentation.ts"
+    candidate.write_text("export {};\n", encoding="utf-8")
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+    assert intent is not None
+    hook = Path(run(workspace.path, "git", "rev-parse", "--git-path", "hooks/pre-commit"))
+    if not hook.is_absolute():
+        hook = workspace.path / hook
+    hook.write_text(
+        f"#!/bin/sh\n{hook_command} '{attacker}'\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    with pytest.raises(WorkspaceError, match="configured repository"):
+        manager.publish_intent(
+            workspace,
+            intent,
+            issue_number=20,
+            title="Improve Eve tracing",
+            expected_snapshot=None,
+        )
+
+    assert (
+        manager._run(
+            workspace.path,
+            ["git", "ls-remote", "--heads", str(remote), workspace.branch],
+        ).stdout
+        == ""
+    )
+    assert (
+        manager._run(
+            workspace.path,
+            ["git", "ls-remote", "--heads", str(attacker), workspace.branch],
+        ).stdout
+        == ""
+    )
+
+
+def test_publication_rejects_a_recovered_commit_with_unsafe_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    candidate = workspace.path / "instrumentation.ts"
+    candidate.write_text("export {};\n", encoding="utf-8")
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+    assert intent is not None
+    run(workspace.path, "git", "add", candidate.name)
+    run(
+        workspace.path,
+        "git",
+        "-c",
+        "user.name=api_token=literal-production-secret",
+        "-c",
+        "user.email=halo@example.test",
+        "commit",
+        "-m",
+        "halo: investigate issue #20 — Improve Eve tracing",
+    )
+
+    with pytest.raises(WorkspaceError, match="unsafe Git commit metadata"):
+        manager.publish_intent(
+            workspace,
+            intent,
+            issue_number=20,
+            title="Improve Eve tracing",
+            expected_snapshot=None,
+        )
+
+    assert (
+        manager._run(
+            workspace.path,
+            ["git", "ls-remote", "--heads", "origin", workspace.branch],
+        ).stdout
+        == ""
+    )
+
+
+def test_publication_rejects_a_recovered_commit_with_duplicate_author(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    candidate = workspace.path / "instrumentation.ts"
+    candidate.write_text("export {};\n", encoding="utf-8")
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+    assert intent is not None
+    run(workspace.path, "git", "add", candidate.name)
+    tree = run(workspace.path, "git", "write-tree")
+    commit_message = "halo: investigate issue #20 — Improve Eve tracing"
+    created = _store_raw_commit(
+        workspace,
+        [
+            f"tree {tree}",
+            f"parent {intent.parent_revision}",
+            "author Other Author <other@example.test> 1700000000 +0000",
+            ("author Shea Halo <shea-halo@users.noreply.github.com> 1700000000 +0000"),
+            ("committer Shea Halo <shea-halo@users.noreply.github.com> 1700000000 +0000"),
+        ],
+        commit_message,
+    )
+    run(workspace.path, "git", "reset", "--hard", created)
+
+    with pytest.raises(WorkspaceError, match="identity differs"):
+        manager.publish_intent(
+            workspace,
+            intent,
+            issue_number=20,
+            title="Improve Eve tracing",
+            expected_snapshot=None,
+        )
+
+    assert (
+        manager._run(
+            workspace.path,
+            ["git", "ls-remote", "--heads", "origin", workspace.branch],
+        ).stdout
+        == ""
+    )
+
+
+def test_publication_rejects_a_recovered_commit_with_a_second_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    candidate = workspace.path / "instrumentation.ts"
+    candidate.write_text("export {};\n", encoding="utf-8")
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+    assert intent is not None
+    run(workspace.path, "git", "add", candidate.name)
+    tree = run(workspace.path, "git", "write-tree")
+    base_tree = run(workspace.path, "git", "rev-parse", f"{intent.parent_revision}^{{tree}}")
+    unrelated_parent = _store_raw_commit(
+        workspace,
+        [
+            f"tree {base_tree}",
+            "author Other Author <other@example.test> 1699999999 +0000",
+            "committer Other Author <other@example.test> 1699999999 +0000",
+        ],
+        "unrelated history",
+    )
+    created = _store_raw_commit(
+        workspace,
+        [
+            f"tree {tree}",
+            f"parent {intent.parent_revision}",
+            f"parent {unrelated_parent}",
+            ("author Shea Halo <shea-halo@users.noreply.github.com> 1700000000 +0000"),
+            ("committer Shea Halo <shea-halo@users.noreply.github.com> 1700000000 +0000"),
+        ],
+        "halo: investigate issue #20 — Improve Eve tracing",
+    )
+    run(workspace.path, "git", "reset", "--hard", created)
+
+    with pytest.raises(WorkspaceError, match="ambiguous parent"):
+        manager.publish_intent(
+            workspace,
+            intent,
+            issue_number=20,
+            title="Improve Eve tracing",
+            expected_snapshot=None,
+        )
+
+    assert (
+        manager._run(
+            workspace.path,
+            ["git", "ls-remote", "--heads", "origin", workspace.branch],
+        ).stdout
+        == ""
+    )
+
+
+def test_publication_validates_the_raw_commit_instead_of_a_replace_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    candidate = workspace.path / "instrumentation.ts"
+    candidate.write_text("export {};\n", encoding="utf-8")
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+    assert intent is not None
+    run(workspace.path, "git", "add", candidate.name)
+    tree = run(workspace.path, "git", "write-tree")
+    message = "halo: investigate issue #20 — Improve Eve tracing"
+    common = [f"tree {tree}", f"parent {intent.parent_revision}"]
+    unsafe_commit = _store_raw_commit(
+        workspace,
+        [
+            *common,
+            "author Other Author <other@example.test> 1700000000 +0000",
+            "committer Other Author <other@example.test> 1700000000 +0000",
+        ],
+        message,
+    )
+    safe_commit = _store_raw_commit(
+        workspace,
+        [
+            *common,
+            ("author Shea Halo <shea-halo@users.noreply.github.com> 1700000000 +0000"),
+            ("committer Shea Halo <shea-halo@users.noreply.github.com> 1700000000 +0000"),
+        ],
+        message,
+    )
+    run(workspace.path, "git", "replace", unsafe_commit, safe_commit)
+    run(workspace.path, "git", "reset", "--hard", unsafe_commit)
+
+    with pytest.raises(WorkspaceError, match="identity differs"):
+        manager.publish_intent(
+            workspace,
+            intent,
+            issue_number=20,
+            title="Improve Eve tracing",
+            expected_snapshot=None,
+        )
+
+    assert (
+        manager._run(
+            workspace.path,
+            ["git", "ls-remote", "--heads", "origin", workspace.branch],
+        ).stdout
+        == ""
+    )
+
+
+def test_publication_pushes_the_validated_object_when_head_moves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    candidate = workspace.path / "instrumentation.ts"
+    candidate.write_text("export {};\n", encoding="utf-8")
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+    assert intent is not None
+    original_run = manager._run
+    moved = False
+    pushed_head: str | None = None
+
+    def move_head_before_push(
+        cwd: Path,
+        args: list[str],
+        *,
+        check: bool = True,
+        environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal moved, pushed_head
+        if args[:2] == ["git", "push"] and not moved:
+            moved = True
+            source_ref = args[-1].partition(":")[0]
+            pushed_head = run(workspace.path, "git", "rev-parse", "--verify", source_ref)
+            run(workspace.path, "git", "reset", "--hard", workspace.base_revision)
+        return original_run(cwd, args, check=check, environment=environment)
+
+    monkeypatch.setattr(manager, "_run", move_head_before_push)
+
+    with pytest.raises(WorkspaceError, match="HEAD changed during publication"):
+        manager.publish_intent(
+            workspace,
+            intent,
+            issue_number=20,
+            title="Improve Eve tracing",
+            expected_snapshot=None,
+        )
+
+    assert moved
+    pushed = original_run(
+        workspace.path,
+        ["git", "ls-remote", "--heads", str(remote), workspace.branch],
+    ).stdout.split()
+    assert len(pushed) == 2
+    assert pushed_head is not None
+    assert pushed[0] == pushed_head
+
+
+def test_publication_uses_an_unambiguous_ref_when_a_branch_is_named_like_the_oid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    candidate = workspace.path / "instrumentation.ts"
+    candidate.write_text("export {};\n", encoding="utf-8")
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+    assert intent is not None
+    original_validate = manager._validate_commit_metadata
+
+    def create_ambiguous_branch(
+        validated_workspace: HaloWorkspace,
+        head: str,
+        *,
+        expected_message: str,
+        expected_parent: str,
+    ) -> None:
+        original_validate(
+            validated_workspace,
+            head,
+            expected_message=expected_message,
+            expected_parent=expected_parent,
+        )
+        run(
+            workspace.path,
+            "git",
+            "branch",
+            head,
+            workspace.base_revision,
+        )
+
+    monkeypatch.setattr(manager, "_validate_commit_metadata", create_ambiguous_branch)
+    snapshot = manager.publish_intent(
+        workspace,
+        intent,
+        issue_number=20,
+        title="Improve Eve tracing",
+        expected_snapshot=None,
+    )
+
+    assert snapshot.head_revision != workspace.base_revision
+    assert (
+        run(remote, "git", "rev-parse", f"refs/heads/{workspace.branch}") == snapshot.head_revision
+    )
+    assert (
+        manager._run(
+            workspace.path,
+            [
+                "git",
+                "rev-parse",
+                "--verify",
+                f"refs/shea-halo/publications/{snapshot.head_revision}",
+            ],
+            check=False,
+        ).returncode
+        != 0
+    )
+
+
+def _store_raw_commit(
+    workspace: HaloWorkspace,
+    headers: list[str],
+    message: str,
+) -> str:
+    raw_commit = "\n".join([*headers, "", message, ""])
+    return subprocess.run(
+        ["git", "hash-object", "--literally", "-t", "commit", "-w", "--stdin"],
+        cwd=workspace.path,
+        input=raw_commit,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+
+
 def _prepared_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, WorkspaceManager, HaloWorkspace]:
@@ -503,7 +1056,12 @@ def _prepared_workspace(
     run(source, "git", "push", "-u", "origin", "main")
     write_target_config(source)
     manager = WorkspaceManager(HaloConfig.load(source))
-    monkeypatch.setattr(manager, "_validate_source", lambda: None)
+    monkeypatch.setattr(manager, "_validate_source", lambda: str(remote))
+    monkeypatch.setattr(
+        manager,
+        "_validated_origin_push_url",
+        lambda _path: str(remote),
+    )
     workspace = manager.prepare(issue_number=20, title="Improve Eve tracing")
     run(workspace.path, "git", "config", "user.name", "Halo Test")
     run(workspace.path, "git", "config", "user.email", "halo@example.test")
@@ -632,6 +1190,61 @@ packages:
 
     assert intent is not None
     assert [path.path for path in intent.paths] == ["pnpm-lock.yaml"]
+
+
+def test_snapshot_accepts_removing_a_preexisting_credential_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    workspace, fixture = _commit_snapshot_fixture(
+        workspace,
+        content="raw_error_summary: token=ghp_not-a-real-token\n",
+    )
+    fixture.write_text("credential fixture removed\n", encoding="utf-8")
+
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+
+    assert intent is not None
+    assert [path.path for path in intent.paths] == [fixture.name]
+
+
+def test_snapshot_accepts_deleting_a_preexisting_sensitive_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    fixture = workspace.path / ".env"
+    fixture.write_text("API_KEY=synthetic-production-secret\n", encoding="utf-8")
+    run(workspace.path, "git", "add", "--force", fixture.name)
+    run(workspace.path, "git", "commit", "-m", "add sensitive fixture")
+    workspace = HaloWorkspace(
+        path=workspace.path,
+        branch=workspace.branch,
+        base_revision=run(workspace.path, "git", "rev-parse", "HEAD"),
+    )
+    fixture.unlink()
+
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+
+    assert intent is not None
+    assert [(path.path, path.state) for path in intent.paths] == [(fixture.name, "deleted")]
+
+
+def test_snapshot_rejects_safe_edits_while_a_preexisting_credential_remains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    credential_line = "raw_error_summary: token=ghp_not-a-real-token"
+    workspace, fixture = _commit_snapshot_fixture(
+        workspace,
+        content=f"{credential_line}\nvalue=before\n",
+    )
+    fixture.write_text(f"{credential_line}\nvalue=after\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match="credential material"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
 
 
 def test_snapshot_rejects_shea_runtime_artifacts_even_if_unignored(
@@ -837,11 +1450,11 @@ def test_snapshot_fails_closed_for_unsafe_content_in_a_binary_diff(
     )
 
     assert manager._path_has_binary_diff(workspace, fixture.name)
-    with pytest.raises(WorkspaceError, match="host absolute path"):
+    with pytest.raises(WorkspaceError, match="opaque or binary"):
         manager.create_publication_intent(workspace, expected_snapshot=None)
 
 
-def test_snapshot_scans_canonical_added_text_after_working_tree_decoding(
+def test_snapshot_rejects_changed_paths_with_working_tree_encoding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -864,7 +1477,71 @@ def test_snapshot_scans_canonical_added_text_after_working_tree_decoding(
         "value: after\nfixture: /Users/alice/private/trace.jsonl\n".encode("utf-16")
     )
 
-    with pytest.raises(WorkspaceError, match="host absolute path"):
+    with pytest.raises(WorkspaceError, match="working-tree encoding"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_rejects_credential_changes_with_working_tree_encoding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    attributes = workspace.path / ".gitattributes"
+    fixture = workspace.path / "encoded-fixture.txt"
+    attributes.write_text(
+        f"{fixture.name} working-tree-encoding=UTF-16\n",
+        encoding="utf-8",
+    )
+    fixture.write_bytes("value: before\n".encode("utf-16"))
+    run(workspace.path, "git", "add", attributes.name, fixture.name)
+    run(workspace.path, "git", "commit", "-m", "add encoded fixture")
+    workspace = HaloWorkspace(
+        path=workspace.path,
+        branch=workspace.branch,
+        base_revision=run(workspace.path, "git", "rev-parse", "HEAD"),
+    )
+    fixture.write_bytes('value: after\napi_key = "literal-production-secret"\n'.encode("utf-16"))
+
+    with pytest.raises(WorkspaceError, match="working-tree encoding"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_rejects_removing_working_tree_encoding_while_changing_its_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    attributes = workspace.path / ".gitattributes"
+    fixture = workspace.path / "encoded-fixture.txt"
+    attributes.write_text(
+        f"{fixture.name} working-tree-encoding=UTF-16\n",
+        encoding="utf-8",
+    )
+    fixture.write_bytes("value: before\n".encode("utf-16"))
+    run(workspace.path, "git", "add", attributes.name, fixture.name)
+    run(workspace.path, "git", "commit", "-m", "add encoded fixture")
+    workspace = HaloWorkspace(
+        path=workspace.path,
+        branch=workspace.branch,
+        base_revision=run(workspace.path, "git", "rev-parse", "HEAD"),
+    )
+    attributes.write_text("", encoding="utf-8")
+    fixture.write_bytes('api_key = "literal-production-secret"\n'.encode("utf-16"))
+
+    with pytest.raises(WorkspaceError, match="working-tree encoding"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_rejects_unmarked_non_utf8_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    (workspace.path / "opaque.bin").write_bytes(
+        'api_key = "literal-production-secret"\n'.encode("utf-16")
+    )
+
+    with pytest.raises(WorkspaceError, match="opaque or binary"):
         manager.create_publication_intent(workspace, expected_snapshot=None)
 
 
@@ -935,6 +1612,31 @@ def test_snapshot_rejects_changed_paths_with_clean_filters(
         branch=workspace.branch,
         base_revision=run(workspace.path, "git", "rev-parse", "HEAD"),
     )
+    fixture.write_text("value: after\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match="Git clean filter"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_rejects_removing_a_clean_filter_while_changing_its_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    attributes = workspace.path / ".gitattributes"
+    fixture = workspace.path / "filtered-fixture.txt"
+    attributes.write_text(f"{fixture.name} filter=unstable\n", encoding="utf-8")
+    fixture.write_text("value: before\n", encoding="utf-8")
+    run(workspace.path, "git", "config", "filter.unstable.clean", "cat")
+    run(workspace.path, "git", "config", "filter.unstable.smudge", "cat")
+    run(workspace.path, "git", "add", attributes.name, fixture.name)
+    run(workspace.path, "git", "commit", "-m", "add filtered fixture")
+    workspace = HaloWorkspace(
+        path=workspace.path,
+        branch=workspace.branch,
+        base_revision=run(workspace.path, "git", "rev-parse", "HEAD"),
+    )
+    attributes.write_text("", encoding="utf-8")
     fixture.write_text("value: after\n", encoding="utf-8")
 
     with pytest.raises(WorkspaceError, match="Git clean filter"):

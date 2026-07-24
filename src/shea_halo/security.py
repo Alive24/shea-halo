@@ -177,9 +177,13 @@ def sanitized_environment(environment: Mapping[str, str] | None = None) -> dict[
 
 
 def git_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Return a secret-free Git environment while preserving authentication handles."""
+    """Return a constrained Git environment while preserving authentication handles."""
     source = _source_environment(environment)
-    sanitized = sanitized_environment(source)
+    sanitized = {
+        name: value
+        for name, value in sanitized_environment(source).items()
+        if not name.startswith("GIT_") or name in _SAFE_GIT_AUTH_HANDLES
+    }
     sanitized.update(
         {
             name: source[name]
@@ -187,6 +191,7 @@ def git_environment(environment: Mapping[str, str] | None = None) -> dict[str, s
             if isinstance(source.get(name), str) and source[name]
         }
     )
+    sanitized["GIT_NO_REPLACE_OBJECTS"] = "1"
     return sanitized
 
 

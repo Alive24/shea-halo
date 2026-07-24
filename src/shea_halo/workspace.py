@@ -25,6 +25,8 @@ from shea_halo.security import (
 _SLUG_PART = re.compile(r"[a-z0-9]+")
 _GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 MAX_SNAPSHOT_FILE_BYTES = 10 * 1024 * 1024
+_HALO_GIT_NAME = "Shea Halo"
+_HALO_GIT_EMAIL = "shea-halo@users.noreply.github.com"
 
 
 class WorkspaceError(RuntimeError):
@@ -79,13 +81,14 @@ class WorkspaceManager:
         args: list[str],
         *,
         check: bool = True,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         process = subprocess.run(
             args,
             cwd=cwd,
             text=True,
             capture_output=True,
-            env=git_environment(),
+            env=git_environment() if environment is None else environment,
             check=False,
         )
         if check and process.returncode:
@@ -95,17 +98,80 @@ class WorkspaceManager:
             raise WorkspaceError(f"{safe_command} failed: {safe_detail}")
         return process
 
-    def _validate_source(self) -> None:
+    @staticmethod
+    def _run_bytes(cwd: Path, args: list[str]) -> bytes:
+        process = subprocess.run(
+            args,
+            cwd=cwd,
+            text=False,
+            capture_output=True,
+            env=git_environment(),
+            check=False,
+        )
+        if process.returncode:
+            detail = process.stderr.decode("utf-8", errors="replace").strip()
+            safe_detail = redact_text(detail)
+            safe_command = redact_text(" ".join(args[:3]))
+            raise WorkspaceError(f"{safe_command} failed: {safe_detail}")
+        return process.stdout
+
+    def _validated_origin_push_url(self, path: Path) -> str:
+        fetch_urls = [
+            url
+            for url in self._run(
+                path,
+                ["git", "remote", "get-url", "--all", "origin"],
+            ).stdout.splitlines()
+            if url
+        ]
+        push_urls = [
+            url
+            for url in self._run(
+                path,
+                ["git", "remote", "get-url", "--push", "--all", "origin"],
+            ).stdout.splitlines()
+            if url
+        ]
+        if len(fetch_urls) != 1 or len(push_urls) != 1:
+            raise WorkspaceError("origin must resolve to one fetch URL and one push URL")
+        for url in (*fetch_urls, *push_urls):
+            repository = _repository_from_remote(url)
+            if repository is None or repository.casefold() != self.config.repository.casefold():
+                raise WorkspaceError(
+                    f"origin does not match configured repository {self.config.repository}"
+                )
+        remote_names = self._run(path, ["git", "remote"]).stdout.splitlines()
+        if push_urls[0] in remote_names:
+            raise WorkspaceError("origin push URL conflicts with a configured remote name")
+        rewrites = self._run(
+            path,
+            [
+                "git",
+                "config",
+                "-z",
+                "--get-regexp",
+                r"^url\..*\.(insteadof|pushinsteadof)$",
+            ],
+            check=False,
+        )
+        if rewrites.returncode not in {0, 1}:
+            raise WorkspaceError("failed to inspect Git URL rewrite configuration")
+        for record in rewrites.stdout.split("\0"):
+            if not record:
+                continue
+            _, separator, prefix = record.partition("\n")
+            if not separator:
+                raise WorkspaceError("Git returned malformed URL rewrite configuration")
+            if push_urls[0].startswith(prefix):
+                raise WorkspaceError("origin push URL is subject to another Git URL rewrite")
+        return push_urls[0]
+
+    def _validate_source(self) -> str:
         root = self.config.root
         top = self._run(root, ["git", "rev-parse", "--show-toplevel"]).stdout.strip()
         if Path(top).resolve() != root:
             raise WorkspaceError("target root is not the canonical Git checkout root")
-        remote = self._run(root, ["git", "remote", "get-url", "origin"]).stdout.strip()
-        repository = _repository_from_remote(remote)
-        if repository is None or repository.casefold() != self.config.repository.casefold():
-            raise WorkspaceError(
-                f"origin does not match configured repository {self.config.repository}"
-            )
+        return self._validated_origin_push_url(root)
 
     def current_base_revision(self) -> str:
         self._validate_source()
@@ -583,10 +649,15 @@ class WorkspaceManager:
         if self._remote_head(path, branch) != expected_snapshot.head_revision:
             raise WorkspaceError("remote Halo branch differs from its workpad snapshot")
 
-    def _remote_head(self, path: Path, branch: str) -> str | None:
+    def _remote_head(
+        self,
+        path: Path,
+        branch: str,
+        remote: str = "origin",
+    ) -> str | None:
         process = self._run(
             path,
-            ["git", "ls-remote", "--heads", "origin", branch],
+            ["git", "ls-remote", "--heads", remote, branch],
             check=False,
         )
         if process.returncode not in {0, 2}:
@@ -706,18 +777,22 @@ class WorkspaceManager:
         self,
         workspace: HaloWorkspace,
         relative: str,
+        *,
+        source: str | None = None,
     ) -> tuple[bool, bool]:
+        args = [
+            "git",
+            "--literal-pathspecs",
+            "check-attr",
+            "-z",
+            "--all",
+        ]
+        if source is not None:
+            args.extend(["--source", source])
+        args.extend(["--", relative])
         rendered = self._run(
             workspace.path,
-            [
-                "git",
-                "--literal-pathspecs",
-                "check-attr",
-                "-z",
-                "--all",
-                "--",
-                relative,
-            ],
+            args,
         ).stdout
         fields = rendered.split("\0")
         if fields and fields[-1] == "":
@@ -741,43 +816,74 @@ class WorkspaceManager:
             relative_path = Path(relative)
             if ".shea" in relative_path.parts:
                 raise WorkspaceError("refusing to snapshot Shea runtime or observation artifacts")
-            if is_sensitive_path(Path(relative)):
-                raise WorkspaceError(
-                    f"refusing to snapshot sensitive file: {redact_text(relative)}"
-                )
             path = (root / relative).resolve()
             if not path.is_relative_to(root):
                 raise WorkspaceError("snapshot path escapes the managed Halo worktree")
             if not path.is_file():
                 continue
+            if is_sensitive_path(Path(relative)):
+                raise WorkspaceError(
+                    f"refusing to snapshot sensitive file: {redact_text(relative)}"
+                )
             size = path.stat().st_size
             if size > MAX_SNAPSHOT_FILE_BYTES:
                 raise WorkspaceError(
                     f"refusing to snapshot file larger than {MAX_SNAPSHOT_FILE_BYTES} bytes: "
                     f"{redact_text(relative)}"
                 )
-            content = path.read_text(encoding="utf-8", errors="replace")
+            current_filter, current_working_tree_encoding = self._canonical_transform_attributes(
+                workspace,
+                relative,
+            )
+            head_filter, head_working_tree_encoding = self._canonical_transform_attributes(
+                workspace,
+                relative,
+                source="HEAD",
+            )
+            if current_filter or head_filter:
+                raise WorkspaceError(
+                    f"refusing to snapshot a path with a Git clean filter: {redact_text(relative)}"
+                )
+            if current_working_tree_encoding or head_working_tree_encoding:
+                raise WorkspaceError(
+                    f"refusing to snapshot a path with an opaque working-tree encoding: "
+                    f"{redact_text(relative)}"
+                )
+            raw_content = path.read_bytes()
+            if len(raw_content) > MAX_SNAPSHOT_FILE_BYTES:
+                raise WorkspaceError(
+                    f"refusing to snapshot file larger than {MAX_SNAPSHOT_FILE_BYTES} bytes: "
+                    f"{redact_text(relative)}"
+                )
+            try:
+                content = raw_content.decode("utf-8")
+            except UnicodeDecodeError:
+                raise WorkspaceError(
+                    f"refusing to snapshot opaque or binary content: {redact_text(relative)}"
+                ) from None
+            if "\0" in content:
+                raise WorkspaceError(
+                    f"refusing to snapshot opaque or binary content: {redact_text(relative)}"
+                )
             if contains_sensitive_text(content):
                 raise WorkspaceError(
                     f"refusing to snapshot file containing credential material: "
                     f"{redact_text(relative)}"
                 )
-            has_filter, has_working_tree_encoding = self._canonical_transform_attributes(
-                workspace,
-                relative,
-            )
-            if has_filter:
-                raise WorkspaceError(
-                    f"refusing to snapshot a path with a Git clean filter: {redact_text(relative)}"
-                )
             regular_at_head = self._regular_file_exists_at_head(workspace, relative)
             binary_diff = regular_at_head and self._path_has_binary_diff(workspace, relative)
-            if (not regular_at_head or binary_diff) and has_working_tree_encoding:
+            if binary_diff:
                 raise WorkspaceError(
-                    f"refusing to snapshot an opaque working-tree encoding: {redact_text(relative)}"
+                    f"refusing to snapshot opaque or binary content: {redact_text(relative)}"
                 )
             if regular_at_head and not binary_diff:
-                if contains_host_absolute_path(self._added_snapshot_text(workspace, relative)):
+                canonical_added_text = self._added_snapshot_text(workspace, relative)
+                if contains_sensitive_text(canonical_added_text):
+                    raise WorkspaceError(
+                        f"refusing to snapshot canonical content containing credential material: "
+                        f"{redact_text(relative)}"
+                    )
+                if contains_host_absolute_path(canonical_added_text):
                     raise WorkspaceError(
                         f"refusing to snapshot a canonical host absolute path: "
                         f"{redact_text(relative)}"
@@ -787,22 +893,6 @@ class WorkspaceManager:
                     f"refusing to snapshot a file containing a host absolute path: "
                     f"{redact_text(relative)}"
                 )
-
-        diff = self._run(
-            workspace.path,
-            [
-                "git",
-                "diff",
-                "--no-ext-diff",
-                "--no-renames",
-                "--no-textconv",
-                "--no-color",
-                "--binary",
-                "HEAD",
-            ],
-        ).stdout
-        if contains_sensitive_text(diff):
-            raise WorkspaceError("refusing to snapshot a diff containing credential material")
 
     @staticmethod
     def _manifest_digest(paths: list[SnapshotPath]) -> str:
@@ -915,6 +1005,64 @@ class WorkspaceManager:
                     "committed publication tree differs from the publication intent"
                 )
 
+    def _validate_commit_metadata(
+        self,
+        workspace: HaloWorkspace,
+        head: str,
+        *,
+        expected_message: str,
+        expected_parent: str,
+    ) -> None:
+        rendered = self._run_bytes(
+            workspace.path,
+            ["git", "cat-file", "commit", head],
+        )
+        try:
+            commit = rendered.decode("utf-8")
+        except UnicodeDecodeError:
+            raise WorkspaceError("refusing to publish non-UTF-8 Git commit metadata") from None
+        if contains_sensitive_text(commit) or contains_host_absolute_path(commit):
+            raise WorkspaceError("refusing to publish unsafe Git commit metadata")
+        headers, separator, message = commit.partition("\n\n")
+        if not separator or message != f"{expected_message}\n":
+            raise WorkspaceError("Git commit message differs from the publication intent")
+
+        parsed_headers: list[tuple[str, str]] = []
+        for line in headers.splitlines():
+            if line.startswith(" "):
+                if not parsed_headers:
+                    raise WorkspaceError("Git commit contains malformed metadata headers")
+                name, value = parsed_headers[-1]
+                parsed_headers[-1] = (name, f"{value}\n{line}")
+                continue
+            name, separator, value = line.partition(" ")
+            if not separator or not name or not value:
+                raise WorkspaceError("Git commit contains malformed metadata headers")
+            parsed_headers.append((name, value))
+
+        def values(name: str) -> list[str]:
+            return [value for header, value in parsed_headers if header == name]
+
+        trees = values("tree")
+        parents = values("parent")
+        authors = values("author")
+        committers = values("committer")
+        if len(trees) != 1 or _GIT_OBJECT_ID.fullmatch(trees[0]) is None:
+            raise WorkspaceError("Git commit contains ambiguous tree metadata")
+        if parents != [expected_parent]:
+            raise WorkspaceError("Git commit contains ambiguous parent metadata")
+        identity = re.compile(
+            rf"{re.escape(_HALO_GIT_NAME)} <{re.escape(_HALO_GIT_EMAIL)}> "
+            r"[0-9]+ [+-][0-9]{4}"
+        )
+        if (
+            len(authors) != 1
+            or identity.fullmatch(authors[0]) is None
+            or len(committers) != 1
+            or identity.fullmatch(committers[0]) is None
+        ):
+            raise WorkspaceError("Git commit identity differs from the publication identity")
+
     def create_publication_intent(
         self,
         workspace: HaloWorkspace,
@@ -963,6 +1111,7 @@ class WorkspaceManager:
         intent: PublicationIntent,
         *,
         expected_snapshot: BranchSnapshot | None,
+        remote: str = "origin",
     ) -> None:
         self._validate_intent_manifest(workspace, intent)
         expected_parent = (
@@ -1001,7 +1150,7 @@ class WorkspaceManager:
             if sorted(path for path in committed_paths if path) != intended_paths:
                 raise WorkspaceError("pending publication commit differs from its intent")
             self._validate_committed_manifest(workspace, intent, head=head)
-        remote_head = self._remote_head(workspace.path, workspace.branch)
+        remote_head = self._remote_head(workspace.path, workspace.branch, remote)
         allowed_remote_heads = {None, head}
         if expected_snapshot is not None:
             allowed_remote_heads.add(expected_snapshot.head_revision)
@@ -1020,10 +1169,15 @@ class WorkspaceManager:
         metadata = f"{workspace.branch}\n{title}"
         if contains_sensitive_text(metadata) or contains_host_absolute_path(metadata):
             raise WorkspaceError("refusing to snapshot unsafe Git metadata")
+        commit_message = f"halo: investigate issue #{issue_number} — {title}"
+        push_url = self._validate_source()
+        if self._validated_origin_push_url(workspace.path) != push_url:
+            raise WorkspaceError("managed Halo worktree resolves a different origin push URL")
         self._validate_publication_state(
             workspace,
             intent,
             expected_snapshot=expected_snapshot,
+            remote=push_url,
         )
         head = self._run(workspace.path, ["git", "rev-parse", "HEAD"]).stdout.strip()
         if head == intent.parent_revision:
@@ -1035,27 +1189,83 @@ class WorkspaceManager:
             )
             if staged.returncode != 1:
                 raise WorkspaceError("publication intent did not produce a staged commit")
+            commit_environment = git_environment()
+            commit_environment.update(
+                {
+                    "GIT_AUTHOR_NAME": _HALO_GIT_NAME,
+                    "GIT_AUTHOR_EMAIL": _HALO_GIT_EMAIL,
+                    "GIT_COMMITTER_NAME": _HALO_GIT_NAME,
+                    "GIT_COMMITTER_EMAIL": _HALO_GIT_EMAIL,
+                }
+            )
             self._run(
                 workspace.path,
-                ["git", "commit", "-m", f"halo: investigate issue #{issue_number} — {title}"],
+                [
+                    "git",
+                    "-c",
+                    "i18n.commitEncoding=UTF-8",
+                    "commit",
+                    "--cleanup=verbatim",
+                    "-m",
+                    commit_message,
+                ],
+                environment=commit_environment,
             )
 
+        if (
+            self._validate_source() != push_url
+            or self._validated_origin_push_url(workspace.path) != push_url
+        ):
+            raise WorkspaceError("origin changed while preparing the Halo publication")
         self._validate_publication_state(
             workspace,
             intent,
             expected_snapshot=expected_snapshot,
-        )
-        self._run(
-            workspace.path,
-            [
-                "git",
-                "push",
-                "--set-upstream",
-                "origin",
-                f"HEAD:refs/heads/{workspace.branch}",
-            ],
+            remote=push_url,
         )
         head = self._run(workspace.path, ["git", "rev-parse", "HEAD"]).stdout.strip()
-        if self._remote_head(workspace.path, workspace.branch) != head:
+        self._validate_commit_metadata(
+            workspace,
+            head,
+            expected_message=commit_message,
+            expected_parent=intent.parent_revision,
+        )
+        publication_ref = f"refs/shea-halo/publications/{head}"
+        self._run(
+            workspace.path,
+            ["git", "update-ref", publication_ref, head],
+        )
+        if (
+            self._run(
+                workspace.path,
+                ["git", "rev-parse", "--verify", publication_ref],
+            ).stdout.strip()
+            != head
+        ):
+            raise WorkspaceError("Halo publication ref differs from the validated commit")
+        try:
+            self._run(
+                workspace.path,
+                [
+                    "git",
+                    "push",
+                    push_url,
+                    f"{publication_ref}:refs/heads/{workspace.branch}",
+                ],
+            )
+        except WorkspaceError:
+            self._run(
+                workspace.path,
+                ["git", "update-ref", "-d", publication_ref, head],
+                check=False,
+            )
+            raise
+        self._run(
+            workspace.path,
+            ["git", "update-ref", "-d", publication_ref, head],
+        )
+        if self._remote_head(workspace.path, workspace.branch, push_url) != head:
             raise WorkspaceError("remote Halo branch did not reach the intended snapshot")
+        if self._run(workspace.path, ["git", "rev-parse", "HEAD"]).stdout.strip() != head:
+            raise WorkspaceError("managed Halo worktree HEAD changed during publication")
         return BranchSnapshot(name=workspace.branch, head_revision=head)

@@ -49,6 +49,12 @@ def test_git_environment_preserves_handles_but_not_raw_credentials() -> None:
         "GH_TOKEN": "ghp_environmentsecret",
         "OPENAI_API_KEY": "sk-environment-secret",
         "GIT_PASSWORD": "password-value",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.hooksPath",
+        "GIT_CONFIG_VALUE_0": "/tmp/untrusted-hooks",
+        "GIT_DIR": "/tmp/untrusted-repository",
+        "GIT_COMMITTER_NAME": "Untrusted Committer",
+        "GIT_NO_REPLACE_OBJECTS": "0",
     }
 
     sanitized = git_environment(environment)
@@ -58,6 +64,7 @@ def test_git_environment_preserves_handles_but_not_raw_credentials() -> None:
         "SSH_AUTH_SOCK": "/tmp/agent.sock",
         "GIT_ASKPASS": "/usr/local/bin/git-askpass",
         "SSH_ASKPASS": "/usr/local/bin/ssh-askpass",
+        "GIT_NO_REPLACE_OBJECTS": "1",
     }
 
 
