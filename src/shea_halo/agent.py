@@ -851,6 +851,9 @@ Current official tracing-guide candidates:
 Exact operator-configured setup, experiment, and verification actions:
 {configured_action_text}
 
+Exploration tool-turn budget:
+{config.investigator_max_turns}
+
 Operator-reserved external-blocker exit codes:
 {json.dumps(sorted(config.external_blocker_exit_codes))}
 
@@ -878,6 +881,12 @@ flush/shutdown, and make the configured action fail if OTLP delivery is rejected
 a proprietary receiver or schema and do not read HALO Desktop internals. The deterministic
 runtime will publish the candidate, rerun all configured runtime experiments with
 CATALYST_SERVICE_VERSION set to the exact candidate revision, and then rerun verification.
+Treat this run as bounded exploration: batch related reads and edits, and return as soon as
+the smallest useful candidate has a successful focused experiment. Do not spend exploratory
+turns reproducing publication, exact-revision attribution, HALO Engine analysis, or the full
+verification pass owned by that deterministic runtime. If evidence is still incomplete,
+return continue_research with useful experimental changes left in the worktree rather than
+exhausting the turn budget.
 If code is ready for a later implementation agent, leave the experimental changes in this
 worktree and return ready_for_todo with a concrete handoff. Never create or propose a PR
 from the Halo branch.

@@ -94,8 +94,9 @@ async def test_investigator_uses_configured_turn_budget(
         def set_attribute(self, _name: str, _value: object) -> None:
             return None
 
-    async def run(_agent: object, _prompt: str, **kwargs: object) -> object:
+    async def run(_agent: object, prompt: str, **kwargs: object) -> object:
         captured.update(kwargs)
+        captured["prompt"] = prompt
         return SimpleNamespace(final_output=decision)
 
     monkeypatch.setattr("shea_halo.agent.IntegrationCatalog.load", lambda _self: [])
@@ -123,6 +124,11 @@ async def test_investigator_uses_configured_turn_budget(
     )
 
     assert captured["max_turns"] == 60
+    assert "Exploration tool-turn budget:\n60" in cast(str, captured["prompt"])
+    assert "Do not spend exploratory\nturns reproducing publication" in cast(
+        str,
+        captured["prompt"],
+    )
 
 
 def test_canonical_trace_guidance_comes_from_the_installed_public_engine_model() -> None:
