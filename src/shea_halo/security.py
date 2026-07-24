@@ -116,8 +116,20 @@ _PLACEHOLDER_VALUES = {
     "test",
     "undefined",
 }
+_SHEBANG_PATH = re.compile(r"(?m)(?P<prefix>^#!)(?P<path>/[^\s]+)")
+_SAFE_SHEBANG_PATHS = {
+    "/bin/bash",
+    "/bin/sh",
+    "/bin/zsh",
+    "/usr/bin/env",
+    "/usr/bin/node",
+    "/usr/bin/perl",
+    "/usr/bin/python",
+    "/usr/bin/python3",
+    "/usr/bin/ruby",
+}
 _POSIX_HOST_PATH = re.compile(
-    r"(?<![A-Za-z0-9+.-]:)(?<![A-Za-z0-9_./+=>\]-])"
+    r"(?<!#!)(?<![A-Za-z0-9+.-]:)(?<![A-Za-z0-9_./+=>\]-])"
     r"(?:"
     r"/(?:Users|home|Volumes|private|tmp|var|opt|etc|usr|Library|root|mnt|srv|"
     r"workspace|Applications|System|nix|data|code|app|project|builds)"
@@ -244,7 +256,14 @@ def redact_host_paths(
     URL paths or repository-relative paths as host filesystem locations.
     """
 
-    redacted = text
+    redacted = _SHEBANG_PATH.sub(
+        lambda match: (
+            match.group(0)
+            if match.group("path") in _SAFE_SHEBANG_PATHS
+            else f"{match.group('prefix')}{HOST_PATH_REDACTED}"
+        ),
+        text,
+    )
     labels = path_labels or {}
     replacements: list[tuple[str, str]] = []
     for raw_path, label in labels.items():
@@ -267,11 +286,15 @@ def redact_host_paths(
 def contains_host_absolute_path(text: str) -> bool:
     """Return whether text still contains a recognizable host absolute path."""
 
+    shebangs = tuple(_SHEBANG_PATH.finditer(text))
+    if any(match.group("path") not in _SAFE_SHEBANG_PATHS for match in shebangs):
+        return True
+    without_safe_shebangs = _SHEBANG_PATH.sub("#!<SYSTEM_INTERPRETER>", text)
     return bool(
-        _FILE_URI.search(text)
-        or _UNC_HOST_PATH.search(text)
-        or _POSIX_HOST_PATH.search(text)
-        or _WINDOWS_HOST_PATH.search(text)
+        _FILE_URI.search(without_safe_shebangs)
+        or _UNC_HOST_PATH.search(without_safe_shebangs)
+        or _POSIX_HOST_PATH.search(without_safe_shebangs)
+        or _WINDOWS_HOST_PATH.search(without_safe_shebangs)
     )
 
 

@@ -178,6 +178,7 @@ def test_redact_host_paths_keeps_repository_relative_paths() -> None:
     text = "\n".join(
         [
             "Inspect src/shea_halo/agent.py and docs/tracing.md.",
+            "#!/usr/bin/env node",
             'const endpoint = base.replace(/\\/$/, "") + "/v1/traces";',
             (
                 "integrity: sha512-4+/OFSqOjoyULo7eN7EA97DE0Xydj/"
@@ -190,6 +191,13 @@ def test_redact_host_paths_keeps_repository_relative_paths() -> None:
 
     assert redact_host_paths(text) == text
     assert not contains_host_absolute_path(text)
+
+
+def test_host_path_detection_rejects_machine_specific_shebang() -> None:
+    text = "#!/Users/alice/project/.venv/bin/python\nprint('unsafe')\n"
+
+    assert contains_host_absolute_path(text)
+    assert redact_host_paths(text).startswith(f"#!{HOST_PATH_REDACTED}\n")
 
 
 def test_structured_persistence_fails_closed_on_redacted_key_collision() -> None:

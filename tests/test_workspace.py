@@ -691,6 +691,7 @@ def test_snapshot_accepts_javascript_url_normalization_regex(
     (workspace.path / "tracing.mjs").write_text(
         "\n".join(
             [
+                "#!/usr/bin/env node",
                 'const endpoint = base.replace(/\\/$/, "") + "/v1/traces";',
                 (
                     "const integrity = "
