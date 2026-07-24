@@ -76,7 +76,10 @@ _AUTHORIZATION_HEADER = re.compile(
     r"(?im)(?P<prefix>^\s*(?:authorization|proxy-authorization)\s*:\s*)"
     r"(?P<value>[^\r\n]+)"
 )
-_COOKIE_HEADER = re.compile(r"(?im)(?P<prefix>^\s*(?:cookie|set-cookie)\s*:\s*)(?P<value>[^\r\n]+)")
+_COOKIE_HEADER = re.compile(
+    r"(?im)(?P<prefix>^\s*(?:cookie|set-cookie)\s*:\s*)"
+    r"(?P<value>[^\r\n=]+=[^\r\n]+)"
+)
 _PRIVATE_KEY_BLOCK = re.compile(
     r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----"
     r".*?"
@@ -94,12 +97,12 @@ _SENSITIVE_ASSIGNMENT_NAME = (
     r"[A-Za-z0-9_.-]{0,64}"
 )
 _QUOTED_ASSIGNMENT = re.compile(
-    rf"(?P<prefix>[\"']?{_SENSITIVE_ASSIGNMENT_NAME}[\"']?\s*[:=]\s*)"
+    rf"(?P<prefix>[\"']?{_SENSITIVE_ASSIGNMENT_NAME}[\"']?[ \t]*[:=][ \t]*)"
     r"(?P<quote>[\"'])(?P<value>[^\"'\r\n]*)(?P=quote)",
     re.IGNORECASE,
 )
 _UNQUOTED_ASSIGNMENT = re.compile(
-    rf"(?P<prefix>\b{_SENSITIVE_ASSIGNMENT_NAME}\b\s*[:=]\s*)"
+    rf"(?P<prefix>\b{_SENSITIVE_ASSIGNMENT_NAME}\b[ \t]*[:=][ \t]*)"
     r"(?P<value>(?![\"'])[^\s,;]+)",
     re.IGNORECASE,
 )

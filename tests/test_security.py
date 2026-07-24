@@ -211,6 +211,19 @@ def test_secret_detection_allows_runtime_credential_references() -> None:
     )
 
 
+def test_secret_detection_does_not_cross_dependency_mapping_lines() -> None:
+    lockfile = """\
+packages:
+  idb-keyval:
+    optional: true
+  token-types: 6.1.2
+  path-key: 3.1.1
+  cookie: 0.7.2
+"""
+
+    assert not contains_sensitive_text(lockfile, {})
+
+
 @pytest.mark.parametrize(
     "path",
     [

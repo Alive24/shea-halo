@@ -634,6 +634,29 @@ def test_snapshot_rejects_common_token_patterns(
     assert run(workspace.path, "git", "diff", "--cached", "--name-only") == ""
 
 
+def test_snapshot_accepts_dependency_names_containing_security_words(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    (workspace.path / "pnpm-lock.yaml").write_text(
+        """\
+packages:
+  idb-keyval:
+    optional: true
+  token-types: 6.1.2
+  path-key: 3.1.1
+  cookie: 0.7.2
+""",
+        encoding="utf-8",
+    )
+
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+
+    assert intent is not None
+    assert [path.path for path in intent.paths] == ["pnpm-lock.yaml"]
+
+
 def test_snapshot_rejects_shea_runtime_artifacts_even_if_unignored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
