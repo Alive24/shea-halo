@@ -618,7 +618,11 @@ class WorkspaceManager:
         )
         return sorted({path for path in (tracked.stdout + untracked.stdout).split("\0") if path})
 
-    def _path_exists_at_head(self, workspace: HaloWorkspace, relative: str) -> bool:
+    def _regular_file_exists_at_head(
+        self,
+        workspace: HaloWorkspace,
+        relative: str,
+    ) -> bool:
         rendered = self._run(
             workspace.path,
             [
@@ -632,9 +636,20 @@ class WorkspaceManager:
                 relative,
             ],
         ).stdout
-        return any(
-            entry.split("\t", 1)[-1] == relative for entry in rendered.split("\0") if "\t" in entry
-        )
+        for entry in rendered.split("\0"):
+            if "\t" not in entry:
+                continue
+            metadata, returned_path = entry.split("\t", 1)
+            fields = metadata.split()
+            if (
+                returned_path == relative
+                and len(fields) == 3
+                and fields[0] in {"100644", "100755"}
+                and fields[1] == "blob"
+                and _GIT_OBJECT_ID.fullmatch(fields[2])
+            ):
+                return True
+        return False
 
     def _added_snapshot_text(self, workspace: HaloWorkspace, relative: str) -> str:
         diff = self._run(
@@ -687,6 +702,39 @@ class WorkspaceManager:
             if record
         )
 
+    def _canonical_transform_attributes(
+        self,
+        workspace: HaloWorkspace,
+        relative: str,
+    ) -> tuple[bool, bool]:
+        rendered = self._run(
+            workspace.path,
+            [
+                "git",
+                "--literal-pathspecs",
+                "check-attr",
+                "-z",
+                "--all",
+                "--",
+                relative,
+            ],
+        ).stdout
+        fields = rendered.split("\0")
+        if fields and fields[-1] == "":
+            fields.pop()
+        if len(fields) % 3:
+            raise WorkspaceError("Git returned malformed canonical transform attributes")
+        attributes: dict[str, str] = {}
+        for index in range(0, len(fields), 3):
+            returned_path, attribute, value = fields[index : index + 3]
+            if returned_path != relative or attribute in attributes:
+                raise WorkspaceError("Git returned unexpected canonical transform attributes")
+            attributes[attribute] = value
+        return (
+            "filter" in attributes,
+            "working-tree-encoding" in attributes,
+        )
+
     def _validate_snapshot(self, workspace: HaloWorkspace, paths: list[str]) -> None:
         root = workspace.path.resolve()
         for relative in paths:
@@ -714,16 +762,31 @@ class WorkspaceManager:
                     f"refusing to snapshot file containing credential material: "
                     f"{redact_text(relative)}"
                 )
-            if contains_host_absolute_path(content):
-                if (
-                    not self._path_exists_at_head(workspace, relative)
-                    or self._path_has_binary_diff(workspace, relative)
-                    or contains_host_absolute_path(self._added_snapshot_text(workspace, relative))
-                ):
+            has_filter, has_working_tree_encoding = self._canonical_transform_attributes(
+                workspace,
+                relative,
+            )
+            if has_filter:
+                raise WorkspaceError(
+                    f"refusing to snapshot a path with a Git clean filter: {redact_text(relative)}"
+                )
+            regular_at_head = self._regular_file_exists_at_head(workspace, relative)
+            binary_diff = regular_at_head and self._path_has_binary_diff(workspace, relative)
+            if (not regular_at_head or binary_diff) and has_working_tree_encoding:
+                raise WorkspaceError(
+                    f"refusing to snapshot an opaque working-tree encoding: {redact_text(relative)}"
+                )
+            if regular_at_head and not binary_diff:
+                if contains_host_absolute_path(self._added_snapshot_text(workspace, relative)):
                     raise WorkspaceError(
-                        f"refusing to snapshot a file containing a host absolute path: "
+                        f"refusing to snapshot a canonical host absolute path: "
                         f"{redact_text(relative)}"
                     )
+            elif contains_host_absolute_path(content):
+                raise WorkspaceError(
+                    f"refusing to snapshot a file containing a host absolute path: "
+                    f"{redact_text(relative)}"
+                )
 
         diff = self._run(
             workspace.path,

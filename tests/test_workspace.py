@@ -486,49 +486,6 @@ def test_publication_revalidates_commit_after_pre_commit_hook(
     )
 
 
-def test_publication_rejects_clean_filter_changed_after_intent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
-    (workspace.path / ".gitattributes").write_text(
-        "*.txt filter=halo-test\n",
-        encoding="utf-8",
-    )
-    candidate = workspace.path / "instrumentation.txt"
-    candidate.write_text("original\n", encoding="utf-8")
-    run(workspace.path, "git", "config", "filter.halo-test.clean", "cat")
-    run(workspace.path, "git", "config", "filter.halo-test.smudge", "cat")
-    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
-    assert intent is not None
-    hook = Path(run(workspace.path, "git", "rev-parse", "--git-path", "hooks/pre-commit"))
-    if not hook.is_absolute():
-        hook = workspace.path / hook
-    hook.write_text(
-        "#!/bin/sh\n"
-        "git config filter.halo-test.clean 'sed s/original/tampered/'\n"
-        "git add instrumentation.txt\n",
-        encoding="utf-8",
-    )
-    hook.chmod(0o755)
-
-    with pytest.raises(WorkspaceError, match="publication intent"):
-        manager.publish_intent(
-            workspace,
-            intent,
-            issue_number=20,
-            title="Improve Eve tracing",
-            expected_snapshot=None,
-        )
-
-    assert (
-        manager._run(
-            workspace.path,
-            ["git", "ls-remote", "--heads", "origin", workspace.branch],
-        ).stdout
-        == ""
-    )
-
-
 def _prepared_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, WorkspaceManager, HaloWorkspace]:
@@ -775,7 +732,35 @@ def test_snapshot_rejects_renaming_a_preexisting_unsafe_fixture(
     )
     fixture.rename(workspace.path / "renamed-fixture.txt")
 
-    assert not manager._path_exists_at_head(workspace, "renamed-fixture.txt")
+    assert not manager._regular_file_exists_at_head(workspace, "renamed-fixture.txt")
+    with pytest.raises(WorkspaceError, match="host absolute path"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_rejects_replacing_a_head_tree_with_an_unsafe_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    tree = workspace.path / "existing-fixture"
+    nested = tree / "nested.txt"
+    tree.mkdir()
+    nested.write_text("safe fixture\n", encoding="utf-8")
+    run(workspace.path, "git", "add", str(nested.relative_to(workspace.path)))
+    run(workspace.path, "git", "commit", "-m", "add existing fixture tree")
+    workspace = HaloWorkspace(
+        path=workspace.path,
+        branch=workspace.branch,
+        base_revision=run(workspace.path, "git", "rev-parse", "HEAD"),
+    )
+    nested.unlink()
+    tree.rmdir()
+    tree.write_text(
+        "fixture: /Users/alice/private/trace.jsonl\n",
+        encoding="utf-8",
+    )
+
+    assert not manager._regular_file_exists_at_head(workspace, tree.name)
     with pytest.raises(WorkspaceError, match="host absolute path"):
         manager.create_publication_intent(workspace, expected_snapshot=None)
 
@@ -853,6 +838,138 @@ def test_snapshot_fails_closed_for_unsafe_content_in_a_binary_diff(
 
     assert manager._path_has_binary_diff(workspace, fixture.name)
     with pytest.raises(WorkspaceError, match="host absolute path"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_scans_canonical_added_text_after_working_tree_decoding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    attributes = workspace.path / ".gitattributes"
+    fixture = workspace.path / "encoded-fixture.txt"
+    attributes.write_text(
+        f"{fixture.name} working-tree-encoding=UTF-16\n",
+        encoding="utf-8",
+    )
+    fixture.write_bytes("value: before\n".encode("utf-16"))
+    run(workspace.path, "git", "add", attributes.name, fixture.name)
+    run(workspace.path, "git", "commit", "-m", "add encoded fixture")
+    workspace = HaloWorkspace(
+        path=workspace.path,
+        branch=workspace.branch,
+        base_revision=run(workspace.path, "git", "rev-parse", "HEAD"),
+    )
+    fixture.write_bytes(
+        "value: after\nfixture: /Users/alice/private/trace.jsonl\n".encode("utf-16")
+    )
+
+    with pytest.raises(WorkspaceError, match="host absolute path"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_rejects_a_new_file_with_opaque_working_tree_encoding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    attributes = workspace.path / ".gitattributes"
+    attributes.write_text(
+        "encoded-fixture.txt working-tree-encoding=UTF-16\n",
+        encoding="utf-8",
+    )
+    run(workspace.path, "git", "add", attributes.name)
+    run(workspace.path, "git", "commit", "-m", "configure working tree encoding")
+    workspace = HaloWorkspace(
+        path=workspace.path,
+        branch=workspace.branch,
+        base_revision=run(workspace.path, "git", "rev-parse", "HEAD"),
+    )
+    (workspace.path / "encoded-fixture.txt").write_bytes(
+        "fixture: /Users/alice/private/trace.jsonl\n".encode("utf-16")
+    )
+
+    with pytest.raises(WorkspaceError, match="opaque working-tree encoding"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_treats_a_sentinel_named_working_tree_encoding_as_opaque(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    attributes = workspace.path / ".gitattributes"
+    attributes.write_text(
+        "encoded-fixture.txt working-tree-encoding=unspecified\n",
+        encoding="utf-8",
+    )
+    run(workspace.path, "git", "add", attributes.name)
+    run(workspace.path, "git", "commit", "-m", "configure sentinel-named encoding")
+    workspace = HaloWorkspace(
+        path=workspace.path,
+        branch=workspace.branch,
+        base_revision=run(workspace.path, "git", "rev-parse", "HEAD"),
+    )
+    (workspace.path / "encoded-fixture.txt").write_text(
+        "safe working-tree content\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkspaceError, match="opaque working-tree encoding"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_rejects_changed_paths_with_clean_filters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    attributes = workspace.path / ".gitattributes"
+    fixture = workspace.path / "filtered-fixture.txt"
+    attributes.write_text(f"{fixture.name} filter=unstable\n", encoding="utf-8")
+    fixture.write_text("value: before\n", encoding="utf-8")
+    run(workspace.path, "git", "add", attributes.name, fixture.name)
+    run(workspace.path, "git", "commit", "-m", "add filtered fixture")
+    workspace = HaloWorkspace(
+        path=workspace.path,
+        branch=workspace.branch,
+        base_revision=run(workspace.path, "git", "rev-parse", "HEAD"),
+    )
+    fixture.write_text("value: after\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match="Git clean filter"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+@pytest.mark.parametrize("driver", ["unspecified", "unset"])
+def test_snapshot_rejects_clean_filter_names_that_match_git_attribute_sentinels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    driver: str,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    attributes = workspace.path / ".gitattributes"
+    attributes.write_text(f"*.txt filter={driver}\n", encoding="utf-8")
+    run(workspace.path, "git", "add", attributes.name)
+    run(workspace.path, "git", "commit", "-m", "configure sentinel-named filter")
+    run(
+        workspace.path,
+        "git",
+        "config",
+        f"filter.{driver}.clean",
+        "printf 'fixture: /Users/alice/private/trace.jsonl\\n'",
+    )
+    workspace = HaloWorkspace(
+        path=workspace.path,
+        branch=workspace.branch,
+        base_revision=run(workspace.path, "git", "rev-parse", "HEAD"),
+    )
+    (workspace.path / "filtered-fixture.txt").write_text(
+        "safe working-tree content\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkspaceError, match="Git clean filter"):
         manager.create_publication_intent(workspace, expected_snapshot=None)
 
 
