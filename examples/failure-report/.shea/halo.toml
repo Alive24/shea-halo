@@ -1,0 +1,38 @@
+schema_version = "shea-halo/v1"
+
+[target]
+repository = "Alive24/FailureReport"
+base_branch = "main"
+
+[tracker]
+owner = "Alive24"
+owner_type = "user"
+project_number = 10
+status_field = "Status"
+research_state = "Halo Research"
+ready_state = "Todo"
+done_state = "Done"
+blocked_state = "Need Human Input"
+trusted_producers = ["Alive24"]
+
+[observation]
+trace_globs = [".shea/artifacts/halo/traces/*.jsonl"]
+desktop_report_globs = [".shea/artifacts/halo/desktop/**/report.md"]
+desktop_otlp_base_endpoint = "http://127.0.0.1:8799"
+
+[experiments]
+commands = [
+  ["pnpm", "install", "--lockfile-only"],
+  ["pnpm", "build"],
+  ["pnpm", "check"],
+  ["pnpm", "test"],
+  ["pnpm", "format:check"],
+]
+
+[verification]
+commands = [
+  ["pnpm", "build"],
+  ["pnpm", "check"],
+  ["pnpm", "test"],
+  ["pnpm", "format:check"],
+]

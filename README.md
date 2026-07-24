@@ -1,0 +1,185 @@
+# Shea Halo
+
+Shea Halo is a GitHub-native research agent for improving agent loops and their harnesses. It observes a repository, analyzes OpenInference-shaped OpenTelemetry traces with the open-source HALO Engine, runs focused experiments in a managed Git worktree, and hands completed research to Shea Symphony through the same GitHub Project item.
+
+The product surface is the Issue and Project—not an action CLI:
+
+1. Create a research Issue in the observed repository.
+2. Add it to the configured GitHub Project with status `Halo Research`.
+3. Shea Halo records an append-only workpad as new Issue comments.
+4. When research is complete and code work is justified, the same item moves to `Todo`.
+
+There are no `analyze`, `instrument`, or `promote` product commands. The no-argument worker process only watches the Project queue and executes that lifecycle.
+
+The first live study is [FailureReport #26](https://github.com/Alive24/FailureReport/issues/26).
+
+## Lifecycle
+
+```text
+Halo Research
+  ├─ more evidence needed ────────────────┐
+  ├─ external blocker → Need Human Input │
+  ├─ hypothesis disproved → Done         │
+  └─ research complete → Todo            │
+                    ▲                    │
+                    └────────────────────┘
+```
+
+`Need Human Input` is reserved for a structured external blocker such as a missing credential, network failure, permission boundary, missing input, or unavailable service. Incomplete evidence stays in `Halo Research`.
+
+Every workpad entry links to its predecessor, shows a human-readable summary first, and puts canonical JSON in a folded block. Shea Halo never edits an Issue body or existing comment. Marker-like comments from untrusted authors are ordinary discussion, while an edited trusted workpad comment fails closed.
+
+On re-entry, Halo reads the prior trusted workpad result plus ordinary Issue discussion. It fingerprints the Issue, discussion, observation artifacts, branch snapshot, and effective experiment contract, so an unchanged incomplete item is not rerun every polling interval. New comments, new trace/Desktop artifacts, code or configuration changes, and a daily documentation refresh reopen the loop.
+
+## Experimental branches
+
+Halo owns `.shea/worktrees/halo/` and may publish `halo/issue-<number>-<stable-semantic-slug>`.
+
+Every published Halo branch has `reuse_policy: experimental_snapshot_only`. It is evidence for selective inspection or cherry-picking; nobody should open a PR from it or continue development on it. Shea Symphony must use a separate implementation worktree and branch.
+
+The runtime checks the complete open/closed/merged PR history for the exact branch before restoration, publication, and handoff; any PR use fails closed. Before a commit or push, Halo appends an immutable publication intent containing the parent revision and a content manifest. A crash before or after push can therefore resume only the exact recorded snapshot.
+
+The base revision, branch, snapshot HEAD, and workpad lineage are persisted and revalidated on re-entry. A renamed Issue does not rename its established branch. Unrecorded files, commits, local HEAD changes, remote branch changes, and publication-manifest mismatches stop restoration.
+
+## Framework-native tracing
+
+Shea Halo has no hardcoded framework setup table. For each investigation it:
+
+1. detects dependency and version evidence from bounded manifests throughout the target checkout;
+2. retrieves the current [Inference documentation index](https://docs.inference.net/llms.txt);
+3. dynamically ranks the current `/integrations/traces/*.md` guides against that evidence;
+4. fetches and snapshots the selected official guide;
+5. applies framework-native instrumentation first;
+6. adds manual OpenInference spans only for lifecycle gaps proven to remain outside native coverage.
+
+The guide URL, retrieval time, SHA-256 digest, dependency evidence, staleness, and selection reason are persisted in the workpad. New framework guides therefore become available without a Shea Halo release.
+
+The catalog address itself is a protocol constant: `https://docs.inference.net/llms.txt`. A target cannot substitute an operator-authored framework table. If the network is unavailable, cached catalog and guide content may support continued research only as explicitly stale evidence; stale guidance cannot promote tracing changes to `Todo`.
+
+For FailureReport, the live dependency scan finds `eve ^0.24.4` and selects the current [Vercel Eve tracing guide](https://docs.inference.net/integrations/traces/eve). The guide—not a Shea Halo framework case—defines Eve's native integration and coverage.
+
+## HALO Desktop and Engine
+
+The interoperability boundary is OpenInference-shaped OpenTelemetry:
+
+- live local observation uses HALO Desktop's OTLP/JSON receiver;
+- offline analysis uses canonical JSONL with one span per line;
+- `halo-engine` consumes that canonical dataset through its public async Python API;
+- exported Desktop `report.md` files can be supplied as bounded plain-text evidence;
+- Shea Halo never reads Desktop SQLite, calls private Desktop APIs, or invents another span schema.
+
+`desktop_otlp_base_endpoint` is a base endpoint, not a hardcoded `/v1/traces` URL. `CATALYST_OTLP_ENDPOINT` overrides it when the worker environment explicitly selects another reachable collector.
+
+Trace discovery covers both the observed checkout and the active experiment worktree. Each canonical record is validated against HALO Engine's public `SpanRecord` contract, including full trace/span identifiers and required span structure, before analysis begins.
+
+An experimental code change cannot move to `Todo` from source diff and model claims alone. Halo requires a successful runtime-recorded experiment, a new or changed canonical candidate trace with an actual parent/child hierarchy, a new or changed HALO Desktop report, post-experiment HALO Engine analysis of that candidate dataset, passing deterministic verification, and the exact published candidate revision. Missing evidence leaves the item in `Halo Research` for the next re-entry.
+
+HALO Engine artifacts are local and ignored under `.shea/artifacts/halo/<run-id>/halo-engine/`:
+
+- `analysis.json` — a versioned manifest with logical trace labels, digests, and run provenance;
+- `events.jsonl` — bounded, sanitized event summaries;
+- `report.md` — the sanitized HALO report;
+- `halo-telemetry.jsonl` — a sanitized local copy of HALO's own telemetry.
+
+HALO Engine indexes and raw intermediate events live only in a per-run temporary directory. Host paths and credential-shaped values are removed before durable artifacts or public workpads are written. Live OTLP sent by the observed target to the configured Desktop or collector remains a trusted observation boundary and may contain application data; operators must secure that endpoint and choose target instrumentation deliberately.
+
+## Target configuration
+
+Each observed checkout commits `.shea/halo.toml`:
+
+```toml
+schema_version = "shea-halo/v1"
+
+[target]
+repository = "Alive24/FailureReport"
+base_branch = "main"
+
+[tracker]
+owner = "Alive24"
+owner_type = "user"
+project_number = 10
+status_field = "Status"
+research_state = "Halo Research"
+ready_state = "Todo"
+done_state = "Done"
+blocked_state = "Need Human Input"
+trusted_producers = ["Alive24"]
+
+[observation]
+trace_globs = [".shea/artifacts/halo/traces/*.jsonl"]
+desktop_report_globs = [".shea/artifacts/halo/desktop/**/report.md"]
+desktop_otlp_base_endpoint = "http://127.0.0.1:8799"
+
+[experiments]
+commands = [
+  ["pnpm", "install", "--lockfile-only"],
+  ["pnpm", "build"],
+  ["pnpm", "check"],
+  ["pnpm", "test"],
+  ["pnpm", "format:check"],
+]
+
+[verification]
+commands = [
+  ["pnpm", "build"],
+  ["pnpm", "check"],
+  ["pnpm", "test"],
+  ["pnpm", "format:check"],
+]
+```
+
+The complete FailureReport example is at [`examples/failure-report/.shea/halo.toml`](examples/failure-report/.shea/halo.toml).
+
+A framework-neutral Issue starting point is at [`examples/halo-research-issue.md`](examples/halo-research-issue.md).
+
+Optional `[runtime]` paths default to `.shea/logs/halo`, `.shea/artifacts/halo`, and `.shea/worktrees/halo`. Runtime paths must remain below the target's `.shea/` directory and cannot escape through symlinks.
+
+Optional `[models]` keys `investigator` and `halo` default to `OPENAI_MODEL`, `HALO_MODEL`, then `gpt-5.6`.
+
+For machine-local onboarding, a complete ignored `.shea/halo.local.toml` takes precedence over the shared file. It is a full replacement, so the effective contract always has one unambiguous source.
+
+`tracker.trusted_producers` is the stable allowlist for the append-only workpad chain. Keep the previous worker identity in this list while rotating a GitHub App or bot token; the currently authenticated worker is also accepted for the comment it writes.
+
+`[experiments].commands` is an exact operator allowlist. The investigator can select one listed argv by index but cannot invent a shell command or append arguments. `[verification].commands` are rerun deterministically before a completed handoff.
+
+When a trusted target must call a real provider during an experiment, the ignored local config may add environment names—not values—with `pass_env = ["OPENAI_API_KEY"]` under `[experiments]`. Shared committed config is forbidden from requesting host credentials. Only explicitly named runtime values are restored to target processes, and the snapshot/workpad redaction boundary still applies.
+
+## Runtime and security boundary
+
+Shea Halo is a long-running local worker because experiments need the target's real Git toolchain, package managers, credentials, and local HALO Desktop. A deployment supplies:
+
+- `SHEA_HALO_TARGETS`: local target checkout roots separated by the platform path separator;
+- `OPENAI_API_KEY`: used by OpenAI Agents SDK and HALO Engine;
+- GitHub authentication through `gh` or `GH_TOKEN`, with repository and Project access;
+- optional `CATALYST_OTLP_ENDPOINT`, `CATALYST_OTLP_TOKEN`, and `CATALYST_SERVICE_NAME`.
+
+If `CATALYST_OTLP_ENDPOINT` is absent, the target's Desktop base endpoint is used. Credentials are runtime configuration and are never written to target config, artifacts, workpads, or branches.
+
+Repository experiment and verification processes receive a credential-scrubbed environment. Their raw output is shown to the active investigator only after redaction; GitHub receives exit status and output digests, not stdout or stderr. Before a branch is staged, Halo rejects sensitive paths, known credential material, common token forms, path escapes, and oversized files.
+
+Deterministic Git lifecycle operations use the host's safe credential-provider handles but never expose those handles or raw credentials to target commands. The target repository and configured experiment commands still execute real host code, so the operator must trust the repositories they choose to observe.
+
+Run exactly one worker per target checkout. On macOS and Linux, a non-blocking local lease under `.shea/logs/halo/worker.lock` prevents concurrent workers from forking the append-only workpad. Separate clones of the same target are not coordinated in this first version.
+
+The service-manager entry point is:
+
+```text
+python -m shea_halo
+```
+
+It accepts no action arguments. Investigation, re-entry, promotion, and completion happen only through GitHub Issues and Project status.
+
+## Development
+
+Use Python 3.11–3.14 and `uv`:
+
+```text
+uv sync --locked --all-groups
+uv run ruff format --check .
+uv run ruff check .
+uv run basedpyright
+uv run pytest
+uv build
+```
+
+Live model and GitHub mutation tests are deliberately opt-in. The ordinary suite uses local bare repositories, recorded catalog fragments, and fake tracker data.

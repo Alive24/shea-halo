@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import os
+import re
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+class ConfigError(ValueError):
+    pass
+
+
+_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _table(data: dict[str, Any], name: str) -> dict[str, Any]:
+    value = data.get(name, {})
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} must be a TOML table")
+    return value
+
+
+def _string(data: dict[str, Any], name: str, default: str | None = None) -> str:
+    value = data.get(name, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{name} must be a non-empty string")
+    return value
+
+
+def _positive_int(data: dict[str, Any], name: str) -> int:
+    value = data.get(name)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ConfigError(f"{name} must be a positive integer")
+    return value
+
+
+def _managed_runtime_path(root: Path, raw: str) -> Path:
+    candidate = Path(raw)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ConfigError(f"runtime path must stay under the target .shea directory: {raw}")
+    resolved_root = root.resolve()
+    managed_root = (resolved_root / ".shea").resolve()
+    if not managed_root.is_relative_to(resolved_root):
+        raise ConfigError("target .shea directory escapes the target repository")
+    resolved = (resolved_root / candidate).resolve()
+    if resolved == managed_root or not resolved.is_relative_to(managed_root):
+        raise ConfigError(f"runtime path must stay below the target .shea directory: {raw}")
+    return resolved
+
+
+def _relative_glob(raw: str) -> str:
+    candidate = Path(raw)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ConfigError(f"observation glob must stay under the target repository: {raw}")
+    return raw
+
+
+def _commands(data: dict[str, Any], table_name: str) -> tuple[tuple[str, ...], ...]:
+    raw_commands = data.get("commands", [])
+    if not isinstance(raw_commands, list):
+        raise ConfigError(f"{table_name}.commands must be a list")
+    commands: list[tuple[str, ...]] = []
+    for command in raw_commands:
+        if (
+            not isinstance(command, list)
+            or not command
+            or not all(isinstance(arg, str) and arg for arg in command)
+        ):
+            raise ConfigError(f"each {table_name} command must be a non-empty argv list")
+        commands.append(tuple(command))
+    return tuple(commands)
+
+
+def _environment_names(data: dict[str, Any], table_name: str) -> tuple[str, ...]:
+    raw_names = data.get("pass_env", [])
+    if not isinstance(raw_names, list) or not all(
+        isinstance(name, str) and _ENVIRONMENT_NAME.fullmatch(name) for name in raw_names
+    ):
+        raise ConfigError(f"{table_name}.pass_env must be a list of environment names")
+    return tuple(sorted(set(raw_names)))
+
+
+def _trusted_producers(data: dict[str, Any]) -> tuple[str, ...]:
+    raw = data.get("trusted_producers", [])
+    if not isinstance(raw, list) or not all(
+        isinstance(producer, str) and producer.strip() for producer in raw
+    ):
+        raise ConfigError("tracker.trusted_producers must be a list of GitHub logins")
+    return tuple(sorted({producer.strip() for producer in raw}, key=str.casefold))
+
+
+@dataclass(frozen=True)
+class TrackerConfig:
+    owner: str
+    owner_type: str
+    project_number: int
+    status_field: str
+    research_state: str
+    ready_state: str
+    done_state: str
+    blocked_state: str
+    trusted_producers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ObservationConfig:
+    trace_globs: tuple[str, ...]
+    desktop_report_globs: tuple[str, ...]
+    desktop_otlp_base_endpoint: str
+
+
+@dataclass(frozen=True)
+class HaloConfig:
+    root: Path
+    repository: str
+    base_branch: str
+    tracker: TrackerConfig
+    observation: ObservationConfig
+    experiment_commands: tuple[tuple[str, ...], ...]
+    target_environment_variables: tuple[str, ...]
+    verification_commands: tuple[tuple[str, ...], ...]
+    logs_dir: Path
+    artifacts_dir: Path
+    worktrees_dir: Path
+    model: str
+    halo_model: str
+
+    @classmethod
+    def load(cls, root: Path) -> HaloConfig:
+        root = root.resolve()
+        local_config = root / ".shea" / "halo.local.toml"
+        uses_local_config = local_config.is_file()
+        config_path = local_config if uses_local_config else root / ".shea" / "halo.toml"
+        try:
+            data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ConfigError(f"missing target config: {config_path}") from exc
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"invalid target config: {exc}") from exc
+
+        if data.get("schema_version") != "shea-halo/v1":
+            raise ConfigError("schema_version must be shea-halo/v1")
+
+        target = _table(data, "target")
+        tracker = _table(data, "tracker")
+        observation = _table(data, "observation")
+        if "catalog_url" in observation:
+            raise ConfigError("observation.catalog_url is fixed by the Shea Halo protocol")
+        experiments = _table(data, "experiments")
+        verification = _table(data, "verification")
+        runtime = _table(data, "runtime")
+        models = _table(data, "models")
+        target_environment_variables = _environment_names(experiments, "experiments")
+        if target_environment_variables and not uses_local_config:
+            raise ConfigError("experiments.pass_env is allowed only in ignored halo.local.toml")
+
+        trace_globs = observation.get("trace_globs", [".shea/artifacts/halo/traces/*.jsonl"])
+        if not isinstance(trace_globs, list) or not all(
+            isinstance(item, str) and item for item in trace_globs
+        ):
+            raise ConfigError("observation.trace_globs must be a list of strings")
+        desktop_report_globs = observation.get(
+            "desktop_report_globs",
+            [".shea/artifacts/halo/desktop/**/report.md"],
+        )
+        if not isinstance(desktop_report_globs, list) or not all(
+            isinstance(item, str) and item for item in desktop_report_globs
+        ):
+            raise ConfigError("observation.desktop_report_globs must be a list of strings")
+
+        owner_type = _string(tracker, "owner_type", "user")
+        if owner_type not in {"user", "organization"}:
+            raise ConfigError("tracker.owner_type must be user or organization")
+
+        return cls(
+            root=root,
+            repository=_string(target, "repository"),
+            base_branch=_string(target, "base_branch", "main"),
+            tracker=TrackerConfig(
+                owner=_string(tracker, "owner"),
+                owner_type=owner_type,
+                project_number=_positive_int(tracker, "project_number"),
+                status_field=_string(tracker, "status_field", "Status"),
+                research_state=_string(tracker, "research_state", "Halo Research"),
+                ready_state=_string(tracker, "ready_state", "Todo"),
+                done_state=_string(tracker, "done_state", "Done"),
+                blocked_state=_string(tracker, "blocked_state", "Need Human Input"),
+                trusted_producers=_trusted_producers(tracker),
+            ),
+            observation=ObservationConfig(
+                trace_globs=tuple(_relative_glob(item) for item in trace_globs),
+                desktop_report_globs=tuple(_relative_glob(item) for item in desktop_report_globs),
+                desktop_otlp_base_endpoint=_string(
+                    observation,
+                    "desktop_otlp_base_endpoint",
+                    "http://127.0.0.1:8799",
+                ),
+            ),
+            experiment_commands=_commands(experiments, "experiments"),
+            target_environment_variables=target_environment_variables,
+            verification_commands=_commands(verification, "verification"),
+            logs_dir=_managed_runtime_path(root, _string(runtime, "logs", ".shea/logs/halo")),
+            artifacts_dir=_managed_runtime_path(
+                root, _string(runtime, "artifacts", ".shea/artifacts/halo")
+            ),
+            worktrees_dir=_managed_runtime_path(
+                root, _string(runtime, "worktrees", ".shea/worktrees/halo")
+            ),
+            model=_string(models, "investigator", os.getenv("OPENAI_MODEL", "gpt-5.6")),
+            halo_model=_string(models, "halo", os.getenv("HALO_MODEL", "gpt-5.6")),
+        )
