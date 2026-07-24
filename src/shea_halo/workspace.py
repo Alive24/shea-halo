@@ -601,13 +601,91 @@ class WorkspaceManager:
     def _snapshot_paths(self, workspace: HaloWorkspace) -> list[str]:
         tracked = self._run(
             workspace.path,
-            ["git", "diff", "--no-ext-diff", "--name-only", "-z", "HEAD"],
+            [
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                "--no-textconv",
+                "--name-only",
+                "-z",
+                "HEAD",
+            ],
         )
         untracked = self._run(
             workspace.path,
             ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         )
         return sorted({path for path in (tracked.stdout + untracked.stdout).split("\0") if path})
+
+    def _path_exists_at_head(self, workspace: HaloWorkspace, relative: str) -> bool:
+        rendered = self._run(
+            workspace.path,
+            [
+                "git",
+                "--literal-pathspecs",
+                "ls-tree",
+                "-z",
+                "--full-tree",
+                "HEAD",
+                "--",
+                relative,
+            ],
+        ).stdout
+        return any(
+            entry.split("\t", 1)[-1] == relative for entry in rendered.split("\0") if "\t" in entry
+        )
+
+    def _added_snapshot_text(self, workspace: HaloWorkspace, relative: str) -> str:
+        diff = self._run(
+            workspace.path,
+            [
+                "git",
+                "--literal-pathspecs",
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                "--no-textconv",
+                "--no-color",
+                "--unified=0",
+                "HEAD",
+                "--",
+                relative,
+            ],
+        ).stdout
+        in_hunk = False
+        added: list[str] = []
+        for line in diff.splitlines():
+            if line.startswith("@@"):
+                in_hunk = True
+            elif line.startswith("diff --git "):
+                in_hunk = False
+            elif in_hunk and line.startswith("+"):
+                added.append(line[1:])
+        return "\n".join(added)
+
+    def _path_has_binary_diff(self, workspace: HaloWorkspace, relative: str) -> bool:
+        rendered = self._run(
+            workspace.path,
+            [
+                "git",
+                "--literal-pathspecs",
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                "--no-textconv",
+                "--numstat",
+                "-z",
+                "HEAD",
+                "--",
+                relative,
+            ],
+        ).stdout
+        return any(
+            len(fields := record.split("\t", 2)) >= 2 and (fields[0] == "-" or fields[1] == "-")
+            for record in rendered.split("\0")
+            if record
+        )
 
     def _validate_snapshot(self, workspace: HaloWorkspace, paths: list[str]) -> None:
         root = workspace.path.resolve()
@@ -637,19 +715,31 @@ class WorkspaceManager:
                     f"{redact_text(relative)}"
                 )
             if contains_host_absolute_path(content):
-                raise WorkspaceError(
-                    f"refusing to snapshot a file containing a host absolute path: "
-                    f"{redact_text(relative)}"
-                )
+                if (
+                    not self._path_exists_at_head(workspace, relative)
+                    or self._path_has_binary_diff(workspace, relative)
+                    or contains_host_absolute_path(self._added_snapshot_text(workspace, relative))
+                ):
+                    raise WorkspaceError(
+                        f"refusing to snapshot a file containing a host absolute path: "
+                        f"{redact_text(relative)}"
+                    )
 
         diff = self._run(
             workspace.path,
-            ["git", "diff", "--no-ext-diff", "--no-color", "--binary", "HEAD"],
+            [
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                "--no-textconv",
+                "--no-color",
+                "--binary",
+                "HEAD",
+            ],
         ).stdout
         if contains_sensitive_text(diff):
             raise WorkspaceError("refusing to snapshot a diff containing credential material")
-        if contains_host_absolute_path(diff):
-            raise WorkspaceError("refusing to snapshot a diff containing a host absolute path")
 
     @staticmethod
     def _manifest_digest(paths: list[SnapshotPath]) -> str:
@@ -727,7 +817,15 @@ class WorkspaceManager:
         for expected in intent.paths:
             rendered = self._run(
                 workspace.path,
-                ["git", "ls-tree", "-z", head, "--", expected.path],
+                [
+                    "git",
+                    "--literal-pathspecs",
+                    "ls-tree",
+                    "-z",
+                    head,
+                    "--",
+                    expected.path,
+                ],
             ).stdout
             entries = [entry for entry in rendered.split("\0") if entry]
             if expected.state == "deleted":
@@ -825,7 +923,17 @@ class WorkspaceManager:
                 raise WorkspaceError("pending publication commit has an unexpected parent")
             committed_paths = self._run(
                 workspace.path,
-                ["git", "diff", "--name-only", "-z", intent.parent_revision, "HEAD"],
+                [
+                    "git",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-renames",
+                    "--no-textconv",
+                    "--name-only",
+                    "-z",
+                    intent.parent_revision,
+                    "HEAD",
+                ],
             ).stdout.split("\0")
             if sorted(path for path in committed_paths if path) != intended_paths:
                 raise WorkspaceError("pending publication commit differs from its intent")

@@ -568,6 +568,26 @@ def _ignore_attempt_artifacts(workspace: HaloWorkspace) -> None:
     assert run(workspace.path, "git", "check-ignore", "node_modules/example/index.js")
 
 
+def _commit_snapshot_fixture(
+    workspace: HaloWorkspace,
+    *,
+    content: str,
+) -> tuple[HaloWorkspace, Path]:
+    fixture = workspace.path / "existing-fixture.txt"
+    fixture.write_text(content, encoding="utf-8")
+    run(workspace.path, "git", "add", fixture.name)
+    run(workspace.path, "git", "commit", "-m", "add existing fixture")
+    head = run(workspace.path, "git", "rev-parse", "HEAD")
+    return (
+        HaloWorkspace(
+            path=workspace.path,
+            branch=workspace.branch,
+            base_revision=head,
+        ),
+        fixture,
+    )
+
+
 @pytest.mark.parametrize(
     "relative",
     [
@@ -679,6 +699,159 @@ def test_snapshot_rejects_host_absolute_paths(
         encoding="utf-8",
     )
 
+    with pytest.raises(WorkspaceError, match="host absolute path"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_accepts_safe_edits_to_files_with_preexisting_unsafe_fixtures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    unsafe_line = "fixture: /Users/alice/private/trace.jsonl"
+    workspace, fixture = _commit_snapshot_fixture(
+        workspace,
+        content=f"{unsafe_line}\nvalue=before\n",
+    )
+    fixture.write_text(f"{unsafe_line}\nvalue=after\n", encoding="utf-8")
+
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+
+    assert intent is not None
+    assert [path.path for path in intent.paths] == [fixture.name]
+
+
+@pytest.mark.parametrize(
+    ("unsafe_line", "message"),
+    [
+        ("fixture: /Users/bob/private/trace.jsonl", "host absolute path"),
+        ('api_key = "another-literal-production-secret"', "credential material"),
+    ],
+)
+def test_snapshot_rejects_new_unsafe_values_in_existing_fixture_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_line: str,
+    message: str,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    workspace, fixture = _commit_snapshot_fixture(
+        workspace,
+        content="fixture: /Users/alice/private/trace.jsonl\n",
+    )
+    fixture.write_text(f"{unsafe_line}\n", encoding="utf-8")
+
+    if message == "host absolute path":
+        assert unsafe_line in manager._added_snapshot_text(workspace, fixture.name)
+    with pytest.raises(WorkspaceError, match=message):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_accepts_removing_a_preexisting_unsafe_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    workspace, fixture = _commit_snapshot_fixture(
+        workspace,
+        content="fixture: /Users/alice/private/trace.jsonl\n",
+    )
+    fixture.write_text("fixture removed\n", encoding="utf-8")
+
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+
+    assert intent is not None
+    assert [path.path for path in intent.paths] == [fixture.name]
+
+
+def test_snapshot_rejects_renaming_a_preexisting_unsafe_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    workspace, fixture = _commit_snapshot_fixture(
+        workspace,
+        content="fixture: /Users/alice/private/trace.jsonl\n",
+    )
+    fixture.rename(workspace.path / "renamed-fixture.txt")
+
+    assert not manager._path_exists_at_head(workspace, "renamed-fixture.txt")
+    with pytest.raises(WorkspaceError, match="host absolute path"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_accepts_renaming_a_safe_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    workspace, fixture = _commit_snapshot_fixture(
+        workspace,
+        content="safe fixture\n",
+    )
+    renamed = workspace.path / "renamed-fixture.txt"
+    fixture.rename(renamed)
+
+    intent = manager.create_publication_intent(workspace, expected_snapshot=None)
+
+    assert intent is not None
+    assert [(path.path, path.state) for path in intent.paths] == [
+        (fixture.name, "deleted"),
+        (renamed.name, "file"),
+    ]
+    snapshot = manager.publish_intent(
+        workspace,
+        intent,
+        issue_number=20,
+        title="Improve Eve tracing",
+        expected_snapshot=None,
+    )
+    assert snapshot.head_revision == run(workspace.path, "git", "rev-parse", "HEAD")
+
+
+def test_snapshot_rejects_a_private_key_completed_across_the_base_and_delta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    workspace, fixture = _commit_snapshot_fixture(
+        workspace,
+        content="-----BEGIN PRIVATE KEY-----\n",
+    )
+    fixture.write_text(
+        "-----BEGIN PRIVATE KEY-----\nsynthetic-private-key-body\n-----END PRIVATE KEY-----\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkspaceError, match="credential material"):
+        manager.create_publication_intent(workspace, expected_snapshot=None)
+
+
+def test_snapshot_fails_closed_for_unsafe_content_in_a_binary_diff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, manager, workspace = _prepared_workspace(tmp_path, monkeypatch)
+    attributes = workspace.path / ".gitattributes"
+    fixture = workspace.path / "existing-fixture.txt"
+    attributes.write_text(f"{fixture.name} -diff\n", encoding="utf-8")
+    fixture.write_text(
+        "fixture: /Users/alice/private/trace.jsonl\nvalue=before\n",
+        encoding="utf-8",
+    )
+    run(workspace.path, "git", "add", attributes.name, fixture.name)
+    run(workspace.path, "git", "commit", "-m", "add binary fixture")
+    workspace = HaloWorkspace(
+        path=workspace.path,
+        branch=workspace.branch,
+        base_revision=run(workspace.path, "git", "rev-parse", "HEAD"),
+    )
+    fixture.write_text(
+        "fixture: /Users/alice/private/trace.jsonl\nvalue=after\n",
+        encoding="utf-8",
+    )
+
+    assert manager._path_has_binary_diff(workspace, fixture.name)
     with pytest.raises(WorkspaceError, match="host absolute path"):
         manager.create_publication_intent(workspace, expected_snapshot=None)
 
