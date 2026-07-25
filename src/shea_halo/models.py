@@ -36,7 +36,14 @@ class Evidence(StrictModel):
 
 
 class Experiment(StrictModel):
-    action_index: int = Field(ge=0)
+    action_index: int = Field(
+        ge=0,
+        le=2**63 - 1,
+        description=(
+            "Index of a configured runtime experiment receipt. Setup and deterministic "
+            "verification receipts are not research experiments."
+        ),
+    )
     hypothesis: str = Field(max_length=800)
     action: str = Field(max_length=800)
     result: str = Field(max_length=800)

@@ -14,12 +14,14 @@ from agents import RunErrorHandlerResult
 from conftest import write_target_config
 
 from shea_halo.agent import (
+    CandidateExperimentBindingError,
     InvestigationError,
     Investigator,
     _repository_search_argv,
     _safe_patch_file,
     blocker_is_runtime_verified,
     candidate_evidence_references,
+    candidate_experiment_correction_prompt,
     canonical_trace_contract,
     configured_actions,
     load_desktop_reports,
@@ -39,6 +41,7 @@ from shea_halo.models import (
     AgentDecision,
     Evidence,
     ExecutedAction,
+    Experiment,
     ExternalBlocker,
     InvestigationResult,
     Outcome,
@@ -451,6 +454,7 @@ def test_terminal_candidate_synthesis_requires_exact_revision_bound_sources() ->
         candidate_revision=revision,
         halo_analysis=analysis,
         candidate_traces=(trace,),
+        validation_actions=[],
     )
 
     with pytest.raises(InvestigationError, match="exact HALO report"):
@@ -466,6 +470,156 @@ def test_terminal_candidate_synthesis_requires_exact_revision_bound_sources() ->
             candidate_revision=revision,
             halo_analysis=analysis,
             candidate_traces=(trace,),
+            validation_actions=[],
+        )
+
+
+def test_candidate_synthesis_rejects_non_experiment_receipt_bindings() -> None:
+    decision = AgentDecision(
+        outcome=Outcome.CONTINUE_RESEARCH,
+        summary="The candidate still needs research.",
+        experiments=[
+            Experiment(
+                action_index=1,
+                hypothesis="The candidate trace can be staged.",
+                action="Stage the exact trace dataset.",
+                result="The runtime experiment passed.",
+            ),
+            Experiment(
+                action_index=2,
+                hypothesis="The candidate builds.",
+                action="Run the build.",
+                result="The deterministic verification passed.",
+            ),
+        ],
+    )
+    actions = [
+        ExecutedAction(
+            index=1,
+            kind="experiment",
+            stage="candidate_validation",
+            command=["pnpm", "run", "halo:trace-smoke"],
+            exit_code=0,
+            stdout_sha256="a" * 64,
+            stderr_sha256="b" * 64,
+            service_version="1" * 40,
+        ),
+        ExecutedAction(
+            index=2,
+            kind="verification",
+            stage="verification",
+            command=["pnpm", "build"],
+            exit_code=0,
+            stdout_sha256="c" * 64,
+            stderr_sha256="d" * 64,
+            service_version="1" * 40,
+        ),
+    ]
+
+    with pytest.raises(CandidateExperimentBindingError) as caught:
+        validate_candidate_synthesis(
+            decision,
+            candidate_revision="1" * 40,
+            halo_analysis=None,
+            candidate_traces=(),
+            validation_actions=actions,
+        )
+
+    assert caught.value.invalid_indices == (2,)
+    assert caught.value.eligible_indices == (1,)
+    corrected = decision.model_copy(update={"experiments": [decision.experiments[0]]})
+    validate_candidate_synthesis(
+        corrected,
+        candidate_revision="1" * 40,
+        halo_analysis=None,
+        candidate_traces=(),
+        validation_actions=(action for action in actions),
+    )
+    unsafe_draft = decision.model_copy(
+        update={
+            "summary": (
+                "Inspect /Users/alice/private/trace.jsonl with "
+                "token ghp_abcdefghijklmnopqrstuvwxyz123456."
+            )
+        }
+    )
+    prompt = candidate_experiment_correction_prompt(
+        "original exact evidence",
+        unsafe_draft,
+        caught.value,
+    )
+    assert "only [1]" in prompt
+    assert '"action_index": 2' in prompt
+    assert "original exact evidence" in prompt
+    assert "/Users/alice" not in prompt
+    assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in prompt
+
+
+def test_experiment_action_index_is_bounded_for_trace_attributes() -> None:
+    with pytest.raises(ValueError):
+        Experiment(
+            action_index=2**63,
+            hypothesis="Oversized model index.",
+            action="Reject before tracing.",
+            result="Not accepted.",
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_update",
+    [
+        {"exit_code": 1},
+        {"service_version": "2" * 40},
+    ],
+)
+def test_terminal_candidate_synthesis_requires_all_runtime_experiments_at_revision(
+    invalid_update: dict[str, object],
+) -> None:
+    revision = "1" * 40
+    trace = _candidate_trace(revision)
+    analysis = _candidate_analysis(revision)
+    report_reference, trace_references = candidate_evidence_references(
+        candidate_revision=revision,
+        halo_analysis=analysis,
+        candidate_traces=(trace,),
+    )
+    assert report_reference is not None
+    decision = AgentDecision(
+        outcome=Outcome.READY_FOR_TODO,
+        summary="The exact candidate supports a handoff.",
+        evidence=[
+            Evidence(claim="HALO report.", source=report_reference),
+            Evidence(claim="Candidate dataset.", source=trace_references[0]),
+        ],
+        experiments=[
+            Experiment(
+                action_index=1,
+                hypothesis="The exact trace can be staged.",
+                action="Stage the trace.",
+                result="The runtime experiment passed.",
+            )
+        ],
+        todo_handoff="Adopt the candidate from a separate implementation branch.",
+    )
+    valid_action = ExecutedAction(
+        index=1,
+        kind="experiment",
+        stage="candidate_validation",
+        command=["pnpm", "run", "halo:trace-smoke"],
+        exit_code=0,
+        stdout_sha256="a" * 64,
+        stderr_sha256="b" * 64,
+        service_version=revision,
+    )
+    unreferenced_invalid_action = valid_action.model_copy(update={"index": 2, **invalid_update})
+
+    with pytest.raises(InvestigationError, match="exact candidate revision"):
+        validate_candidate_synthesis(
+            decision,
+            candidate_revision=revision,
+            halo_analysis=analysis,
+            candidate_traces=(trace,),
+            validation_actions=[valid_action, unreferenced_invalid_action],
         )
 
 
@@ -509,6 +663,7 @@ async def test_candidate_synthesis_is_zero_tool_and_receives_exact_evidence(
     captured: dict[str, object] = {}
 
     async def run(agent: object, prompt: str, **_kwargs: object) -> object:
+        captured["calls"] = cast(int, captured.get("calls", 0)) + 1
         captured["tools"] = getattr(agent, "tools")
         captured["prompt"] = prompt
         return SimpleNamespace(final_output=decision)
@@ -522,6 +677,26 @@ async def test_candidate_synthesis_is_zero_tool_and_receives_exact_evidence(
         exit_code=0,
         stdout_sha256="a" * 64,
         stderr_sha256="b" * 64,
+        service_version=revision,
+    )
+    setup_action = ExecutedAction(
+        index=0,
+        kind="setup",
+        stage="setup",
+        command=["pnpm", "install", "--frozen-lockfile"],
+        exit_code=0,
+        stdout_sha256="c" * 64,
+        stderr_sha256="d" * 64,
+        service_version=revision,
+    )
+    verification_action = ExecutedAction(
+        index=2,
+        kind="verification",
+        stage="verification",
+        command=["pnpm", "test"],
+        exit_code=0,
+        stdout_sha256="e" * 64,
+        stderr_sha256="f" * 64,
         service_version=revision,
     )
     verification = Verification(
@@ -555,12 +730,13 @@ async def test_candidate_synthesis_is_zero_tool_and_receives_exact_evidence(
         halo_analysis=analysis,
         candidate_traces=(trace,),
         trace_validation=trace_validation,
-        validation_actions=[action],
+        validation_actions=[setup_action, action, verification_action],
         verification=[verification],
         source_clean=True,
     )
 
     assert result.outcome == Outcome.NO_CHANGE
+    assert captured["calls"] == 1
     assert captured["tools"] == []
     prompt = cast(str, captured["prompt"])
     assert revision in prompt
@@ -569,3 +745,131 @@ async def test_candidate_synthesis_is_zero_tool_and_receives_exact_evidence(
     payload = json.loads(prompt.split("\n\n", 1)[1])
     assert payload["halo_engine"]["report"] == analysis.final_message
     assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in payload["issue"]["body"]
+    receipts = payload["candidate"]["action_receipts"]
+    assert [item["index"] for item in receipts["setup"]] == [0]
+    assert [item["index"] for item in receipts["runtime_experiments"]] == [1]
+    assert [item["index"] for item in receipts["verification"]] == [2]
+    assert payload["candidate"]["allowed_experiment_action_indices"] == [1]
+
+
+@pytest.mark.parametrize("replacement_valid", [True, False])
+async def test_candidate_synthesis_retries_invalid_experiment_binding_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_valid: bool,
+) -> None:
+    write_target_config(tmp_path)
+    config = HaloConfig.load(tmp_path)
+    revision = "1" * 40
+    trace = _candidate_trace(revision)
+    analysis = _candidate_analysis(revision)
+    report_reference, trace_references = candidate_evidence_references(
+        candidate_revision=revision,
+        halo_analysis=analysis,
+        candidate_traces=(trace,),
+    )
+    assert report_reference is not None
+    runtime_experiment = Experiment(
+        action_index=1,
+        hypothesis="The exact trace can be staged.",
+        action="Stage the trace.",
+        result="The runtime experiment passed.",
+    )
+    reclassified_verification = Experiment(
+        action_index=2,
+        hypothesis="The candidate builds.",
+        action="Run the build.",
+        result="The deterministic verification passed.",
+    )
+    invalid = AgentDecision(
+        outcome=Outcome.READY_FOR_TODO,
+        summary="The exact candidate supports a handoff.",
+        evidence=[
+            Evidence(claim="HALO report.", source=report_reference),
+            Evidence(claim="Candidate dataset.", source=trace_references[0]),
+        ],
+        experiments=[runtime_experiment, reclassified_verification],
+        todo_handoff="Adopt the candidate from a separate implementation branch.",
+    )
+    valid = invalid.model_copy(update={"experiments": [runtime_experiment]})
+    outputs = [invalid, valid if replacement_valid else invalid]
+    prompts: list[str] = []
+    tool_sets: list[object] = []
+
+    async def run(agent: object, prompt: str, **_kwargs: object) -> object:
+        prompts.append(prompt)
+        tool_sets.append(getattr(agent, "tools"))
+        return SimpleNamespace(final_output=outputs[len(prompts) - 1])
+
+    monkeypatch.setattr("shea_halo.agent.Runner.run", run)
+    actions = [
+        ExecutedAction(
+            index=1,
+            kind="experiment",
+            stage="candidate_validation",
+            command=["pnpm", "run", "halo:trace-smoke"],
+            exit_code=0,
+            stdout_sha256="a" * 64,
+            stderr_sha256="b" * 64,
+            service_version=revision,
+        ),
+        ExecutedAction(
+            index=2,
+            kind="verification",
+            stage="verification",
+            command=["pnpm", "build"],
+            exit_code=0,
+            stdout_sha256="c" * 64,
+            stderr_sha256="d" * 64,
+            service_version=revision,
+        ),
+    ]
+    trace_validation = TraceValidation(
+        checkpoint=ObservationCheckpoint(traces=(trace,)),
+        candidate_traces=(trace,),
+        halo_report_sha256=report_reference.split(":")[2].split("@")[0],
+        halo_dataset_verified=True,
+        halo_revision_verified=True,
+        service_version_verified=True,
+        candidate_revision=revision,
+        complete=True,
+    )
+
+    async def synthesize() -> AgentDecision:
+        return await Investigator().synthesize_candidate(
+            config=config,
+            issue_number=26,
+            issue_title="Improve Eve tracing",
+            issue_body="Observe the current harness.",
+            issue_discussion="No additional discussion.",
+            candidate_revision=revision,
+            preliminary_result=InvestigationResult(
+                outcome=Outcome.READY_FOR_TODO,
+                summary="Preliminary result.",
+            ),
+            halo_analysis=analysis,
+            candidate_traces=(trace,),
+            trace_validation=trace_validation,
+            validation_actions=actions,
+            verification=[
+                Verification(
+                    command=["pnpm", "build"],
+                    status="passed",
+                    evidence="exit_code=0",
+                )
+            ],
+            source_clean=True,
+        )
+
+    if replacement_valid:
+        assert await synthesize() == valid
+    else:
+        with pytest.raises(CandidateExperimentBindingError):
+            await synthesize()
+
+    assert len(prompts) == 2
+    assert tool_sets == [[], []]
+    assert "only [1]" in prompts[1]
+    assert '"action_index": 2' in prompts[1]
+    assert report_reference in prompts[1]
+    assert trace.sha256 in prompts[1]

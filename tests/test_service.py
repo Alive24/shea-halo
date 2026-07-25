@@ -249,6 +249,58 @@ def test_ready_gate_rejects_incomplete_or_stale_evidence() -> None:
     assert any("candidate trace hierarchy" in risk for risk in no_runtime_trace.residual_risks)
 
 
+def test_ready_gate_rejects_verification_receipts_reclassified_as_experiments() -> None:
+    ready = _ready_result()
+    verification_action = ExecutedAction(
+        index=2,
+        kind="verification",
+        stage="verification",
+        command=["pnpm", "build"],
+        exit_code=0,
+        stdout_sha256="a" * 64,
+        stderr_sha256="b" * 64,
+        service_version="1" * 40,
+    )
+    invalid = ready.model_copy(
+        update={
+            "experiments": [
+                *ready.experiments,
+                Experiment(
+                    action_index=2,
+                    hypothesis="The candidate builds.",
+                    action="Run deterministic verification.",
+                    result="The build passed.",
+                ),
+            ],
+            "executed_actions": [*ready.executed_actions, verification_action],
+        }
+    )
+
+    gated = HaloService._gate_outcome(invalid)
+
+    assert gated.outcome == Outcome.CONTINUE_RESEARCH
+    assert any("runtime actions" in risk for risk in gated.residual_risks)
+
+
+def test_ready_gate_requires_every_runtime_experiment_at_exact_candidate_revision() -> None:
+    ready = _ready_result()
+    wrong_revision = ready.model_copy(
+        update={
+            "executed_actions": [
+                ready.executed_actions[0].model_copy(update={"service_version": "2" * 40})
+            ]
+        }
+    )
+
+    gated = HaloService._gate_outcome(
+        wrong_revision,
+        candidate_revision="1" * 40,
+    )
+
+    assert gated.outcome == Outcome.CONTINUE_RESEARCH
+    assert any("revision-bound runtime actions" in risk for risk in gated.residual_risks)
+
+
 def test_trace_validation_is_bound_to_post_experiment_engine_dataset() -> None:
     ready = _ready_result()
     assert ready.trace_validation is not None
@@ -776,6 +828,7 @@ class _FakeInvestigator:
         self.synthesis_error: Exception | None = None
         self.synthesis_outcome: Outcome | None = None
         self.synthesis_residual_risks: list[str] | None = None
+        self.synthesis_experiments: list[Experiment] | None = None
 
     async def run(self, **_kwargs: object) -> InvestigationResult:
         self.calls += 1
@@ -819,7 +872,11 @@ class _FakeInvestigator:
             summary=f"Final synthesis: {preliminary.summary}",
             evidence=evidence,
             competing_hypotheses=preliminary.competing_hypotheses,
-            experiments=preliminary.experiments,
+            experiments=(
+                self.synthesis_experiments
+                if self.synthesis_experiments is not None
+                else preliminary.experiments
+            ),
             residual_risks=(
                 self.synthesis_residual_risks
                 if self.synthesis_residual_risks is not None
@@ -1962,6 +2019,66 @@ async def test_validating_reentry_uses_the_original_persisted_observation_baseli
         InvestigationResult.model_validate(failed_head.entry.state.result.model_dump())
         == failed_head.entry.state.result
     )
+
+    checkpoints = iter(
+        (
+            ObservationCheckpoint(),
+            checkpoint,
+            checkpoint,
+        )
+    )
+    investigator.synthesis_error = None
+    investigator.synthesis_outcome = Outcome.READY_FOR_TODO
+    investigator.synthesis_experiments = [
+        Experiment(
+            action_index=2,
+            hypothesis="The candidate builds.",
+            action="Run deterministic verification.",
+            result="The build passed.",
+        )
+    ]
+    binding_failure_github = _FakeGitHub(
+        [
+            IssueComment(
+                database_id=head.comment_id,
+                author="halo-bot",
+                body=render_entry(head.entry, "Validating candidate."),
+                created_at="2026-07-24T00:00:00Z",
+            )
+        ]
+    )
+
+    await service._validate_candidate(
+        config=config,
+        github=cast(GitHubClient, binding_failure_github),
+        metadata=_metadata(),
+        issue=issue,
+        producer="halo-bot",
+        head=head,
+        manager=cast(WorkspaceManager, Manager()),
+        workspace=workspace,
+        workspace_branch=workspace.branch,
+        run_id=validating_state.run_id,
+        snapshot=validating_state.branch,
+        preliminary_result=preliminary,
+        discussion="[]",
+    )
+
+    binding_failure_head = find_head(
+        binding_failure_github.comments,
+        repository=config.repository,
+        issue_number=issue.number,
+        trusted_producers={"halo-bot"},
+    )
+    assert binding_failure_head is not None
+    assert binding_failure_head.entry.state.phase == "research"
+    assert binding_failure_head.entry.state.result is not None
+    assert binding_failure_head.entry.state.result.outcome == Outcome.CONTINUE_RESEARCH
+    assert any(
+        "reclassified non-experiment receipt" in risk
+        for risk in binding_failure_head.entry.state.result.residual_risks
+    )
+    investigator.synthesis_experiments = None
 
     def fail_validation_stage(
         _config: HaloConfig,

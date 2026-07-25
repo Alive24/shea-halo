@@ -983,6 +983,7 @@ class HaloService:
                 candidate_revision=candidate_revision,
                 halo_analysis=post_analysis,
                 candidate_traces=candidate_traces,
+                validation_actions=validation_actions,
             )
         except Exception as exc:
             manager.prepare_validation_workspace(
@@ -1146,7 +1147,10 @@ class HaloService:
                 *(risk for risk in result.residual_risks if risk not in prior_risks),
             )
         prior_risks = set(result.residual_risks)
-        result = self._gate_outcome(result)
+        result = self._gate_outcome(
+            result,
+            candidate_revision=candidate_revision,
+        )
         retained_result_risks = (
             *retained_result_risks,
             *(risk for risk in result.residual_risks if risk not in prior_risks),
@@ -1289,17 +1293,27 @@ class HaloService:
         return WorkpadHead(comment_id=comment.database_id, entry=entry)
 
     @staticmethod
-    def _gate_outcome(result: InvestigationResult) -> InvestigationResult:
+    def _gate_outcome(
+        result: InvestigationResult,
+        *,
+        candidate_revision: str | None = None,
+    ) -> InvestigationResult:
         """Demote unsupported terminal claims to continued research."""
 
         missing: list[str] = []
+        if candidate_revision is None and result.trace_validation is not None:
+            candidate_revision = result.trace_validation.candidate_revision
         candidate_actions = [
             action
             for action in result.executed_actions
             if action.kind == "experiment" and action.stage == "candidate_validation"
         ]
         successful_candidate_indices = {
-            action.index for action in candidate_actions if action.exit_code == 0
+            action.index
+            for action in candidate_actions
+            if action.exit_code == 0
+            and action.service_version
+            and (candidate_revision is None or action.service_version == candidate_revision)
         }
         setup_actions = [action for action in result.executed_actions if action.stage == "setup"]
         experiments_are_bound = bool(result.experiments) and all(
@@ -1310,7 +1324,10 @@ class HaloService:
             for experiment in result.experiments
         )
         candidate_runtime_passed = bool(candidate_actions) and all(
-            action.exit_code == 0 and action.service_version for action in candidate_actions
+            action.exit_code == 0
+            and action.service_version
+            and (candidate_revision is None or action.service_version == candidate_revision)
+            for action in candidate_actions
         )
         setup_passed = all(action.exit_code == 0 for action in setup_actions)
         if result.outcome == Outcome.BLOCKED:
