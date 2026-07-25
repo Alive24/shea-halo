@@ -18,6 +18,7 @@ def test_loads_minimal_target_config(tmp_path: Path) -> None:
     assert config.tracker.trusted_producers == ()
     assert config.worktrees_dir == tmp_path / ".shea/worktrees/halo"
     assert config.observation.catalyst_sdk_base_endpoint == "http://127.0.0.1:8799"
+    assert config.observation.desktop_preflight == "disabled"
     assert config.observation.require_candidate_traces is True
     assert config.setup_commands == (("python", "-m", "pip", "--version"),)
     assert config.experiment_commands == (("python", "-m", "pytest"),)
@@ -104,6 +105,36 @@ def test_rejects_legacy_desktop_otlp_endpoint_field(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ConfigError, match="not supported"):
+        HaloConfig.load(tmp_path)
+
+
+def test_external_desktop_preflight_must_be_enabled_explicitly(tmp_path: Path) -> None:
+    write_target_config(tmp_path)
+    path = tmp_path / ".shea/halo.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "[observation]",
+            '[observation]\ndesktop_preflight = "external"',
+        ),
+        encoding="utf-8",
+    )
+
+    assert HaloConfig.load(tmp_path).observation.desktop_preflight == "external"
+
+
+@pytest.mark.parametrize("value", ['"managed"', '"External"', "true", "1"])
+def test_rejects_invalid_desktop_preflight_modes(tmp_path: Path, value: str) -> None:
+    write_target_config(tmp_path)
+    path = tmp_path / ".shea/halo.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "[observation]",
+            f"[observation]\ndesktop_preflight = {value}",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="desktop_preflight"):
         HaloConfig.load(tmp_path)
 
 
@@ -258,6 +289,10 @@ def test_complete_local_config_takes_precedence(tmp_path: Path) -> None:
             '[experiments]\npass_env = ["OPENAI_API_KEY", "CATALYST_OTLP_TOKEN"]',
         )
         .replace(
+            "[observation]",
+            '[observation]\ndesktop_preflight = "external"',
+        )
+        .replace(
             "[verification]",
             '[models]\napi_mode = "chat_completions"\n\n[verification]',
         ),
@@ -267,6 +302,7 @@ def test_complete_local_config_takes_precedence(tmp_path: Path) -> None:
     config = HaloConfig.load(tmp_path)
     assert config.repository == "Alive24/LocalTarget"
     assert config.api_mode == "chat_completions"
+    assert config.observation.desktop_preflight == "external"
     assert config.target_environment_variables == (
         "CATALYST_OTLP_TOKEN",
         "OPENAI_API_KEY",

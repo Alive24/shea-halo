@@ -95,6 +95,49 @@ class ExternalBlocker(StrictModel):
     failed_action_index: int | None = Field(default=None, ge=0)
 
 
+class HaloDesktopPreflightClassification(StrEnum):
+    PASSED = "passed"
+    UNREACHABLE_SERVICE = "unreachable_service"
+    TIMEOUT = "timeout"
+    INCOMPATIBLE_HEALTH_RESPONSE = "incompatible_health_response"
+    UNSUPPORTED_CONTENT_TYPE = "unsupported_content_type"
+    REJECTED_INGEST = "rejected_ingest"
+    OVERSIZED_RESPONSE = "oversized_response"
+
+
+HttpStatusClass: TypeAlias = Literal["1xx", "2xx", "3xx", "4xx", "5xx"]
+
+
+class HaloDesktopPreflightReceipt(StrictModel):
+    """Bounded public-surface evidence with no endpoint or response content."""
+
+    mode: Literal["external"] = "external"
+    service: Literal["halo-canvas-telemetry"] | None = None
+    health_status_class: HttpStatusClass | None = None
+    ingest_status_class: HttpStatusClass | None = None
+    started_at: datetime
+    completed_at: datetime
+    payload_sha256: str = Field(min_length=64, max_length=64)
+    classification: HaloDesktopPreflightClassification
+
+
+class HaloDesktopPreflightResult(StrictModel):
+    passed: bool
+    receipt: HaloDesktopPreflightReceipt
+    blocker: ExternalBlocker | None = None
+
+    @model_validator(mode="after")
+    def _result_matches_classification(self) -> HaloDesktopPreflightResult:
+        classified_as_passed = (
+            self.receipt.classification == HaloDesktopPreflightClassification.PASSED
+        )
+        if self.passed != classified_as_passed:
+            raise ValueError("Desktop preflight pass state does not match its classification")
+        if self.passed == (self.blocker is not None):
+            raise ValueError("Desktop preflight failures require exactly one blocker")
+        return self
+
+
 class AgentDecision(StrictModel):
     outcome: Outcome
     summary: str = Field(max_length=2_000)
@@ -125,6 +168,7 @@ class InvestigationResult(StrictModel):
     todo_handoff: str | None = Field(default=None, max_length=4_000)
     blocker: ExternalBlocker | None = None
     blocker_verified: bool = False
+    desktop_preflight: HaloDesktopPreflightReceipt | None = None
 
 
 class BranchSnapshot(StrictModel):
