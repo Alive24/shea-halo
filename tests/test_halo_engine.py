@@ -416,6 +416,11 @@ async def test_analysis_persists_only_sanitized_logical_artifacts(
         )
 
     monkeypatch.setattr("engine.main.stream_engine_output_async", fake_stream)
+    configured_api_modes: list[str] = []
+    monkeypatch.setattr(
+        "shea_halo.provider.set_default_openai_api",
+        configured_api_modes.append,
+    )
     monkeypatch.setattr(
         "shea_halo.halo_engine.workspace_manager_head",
         lambda workspace: "a" * 40,
@@ -426,6 +431,7 @@ async def test_analysis_persists_only_sanitized_logical_artifacts(
             root=root,
             repository="Alive24/FailureReport",
             halo_model="gpt-5.6",
+            api_mode="chat_completions",
             artifacts_dir=artifacts_dir,
             observation=SimpleNamespace(
                 trace_globs=(".shea/artifacts/halo/traces/*.jsonl",),
@@ -448,6 +454,8 @@ async def test_analysis_persists_only_sanitized_logical_artifacts(
     )
 
     assert artifact is not None
+    assert artifact.api_mode == "chat_completions"
+    assert configured_api_modes == ["chat_completions"]
     run_dir = artifacts_dir / "run-26" / "halo-engine"
     manifest = json.loads((run_dir / "analysis.json").read_text(encoding="utf-8"))
     report = (run_dir / "report.md").read_text(encoding="utf-8")
@@ -462,6 +470,7 @@ async def test_analysis_persists_only_sanitized_logical_artifacts(
     assert "<workspace>/src/agent.py" in report
     assert "<engine-temporary>/halo-telemetry.jsonl" in report
     assert manifest["dataset"]["files"][0]["path"].startswith("workspace:")
+    assert manifest["api_mode"] == "chat_completions"
     assert manifest["report_path"] == "report.md"
     assert manifest["events_path"] == "events.jsonl"
     assert "Sanitized issue input SHA-256:" in manifest["prompt"]

@@ -62,6 +62,27 @@ def test_immutable_workpad_chain_round_trips() -> None:
     assert head.entry.state.phase == "experimenting"
 
 
+def test_workpad_round_trip_records_the_selected_api_mode() -> None:
+    configured = state().model_copy(update={"api_mode": "chat_completions"})
+    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    body = render_entry(
+        next_entry(configured, None, producer="halo-bot"),
+        f"Started with {secret}.",
+    )
+
+    assert '"api_mode": "chat_completions"' in body
+    assert secret not in body
+    head = find_head(
+        [comment(101, body)],
+        repository="Alive24/FailureReport",
+        issue_number=20,
+        trusted_producers={"halo-bot"},
+    )
+
+    assert head is not None
+    assert head.entry.state.api_mode == "chat_completions"
+
+
 def test_workpad_rejects_forks_without_editing_comments() -> None:
     first = next_entry(state(), None, producer="halo-bot")
     first_comment = comment(101, render_entry(first, "Started."))

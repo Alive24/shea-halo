@@ -10,7 +10,12 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
-from agents import RunErrorHandlerResult
+from agents import (
+    OpenAIChatCompletionsModel,
+    OpenAIResponsesModel,
+    RunConfig,
+    RunErrorHandlerResult,
+)
 from conftest import write_target_config
 
 from shea_halo.agent import (
@@ -118,6 +123,8 @@ async def test_investigator_uses_configured_turn_budget(
     )
     monkeypatch.setattr("shea_halo.agent.agent_span", lambda *_args, **_kwargs: Span())
     monkeypatch.setattr("shea_halo.agent.Runner.run", run)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-runtime-key")
+    config = replace(config, api_mode="chat_completions")
 
     investigation = await Investigator().run(
         config=config,
@@ -132,6 +139,8 @@ async def test_investigator_uses_configured_turn_budget(
     )
 
     assert captured["max_turns"] == 60
+    run_config = cast(RunConfig, captured["run_config"])
+    assert isinstance(run_config.model_provider.get_model("gpt-test"), OpenAIChatCompletionsModel)
     assert callable(cast(dict[str, object], captured["error_handlers"])["max_turns"])
     assert investigation.turn_budget_exhausted is True
     assert investigation.outcome == Outcome.CONTINUE_RESEARCH
@@ -662,13 +671,15 @@ async def test_candidate_synthesis_is_zero_tool_and_receives_exact_evidence(
     )
     captured: dict[str, object] = {}
 
-    async def run(agent: object, prompt: str, **_kwargs: object) -> object:
+    async def run(agent: object, prompt: str, **kwargs: object) -> object:
         captured["calls"] = cast(int, captured.get("calls", 0)) + 1
         captured["tools"] = getattr(agent, "tools")
         captured["prompt"] = prompt
+        captured["run_config"] = kwargs["run_config"]
         return SimpleNamespace(final_output=decision)
 
     monkeypatch.setattr("shea_halo.agent.Runner.run", run)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-runtime-key")
     action = ExecutedAction(
         index=1,
         kind="experiment",
@@ -738,6 +749,8 @@ async def test_candidate_synthesis_is_zero_tool_and_receives_exact_evidence(
     assert result.outcome == Outcome.NO_CHANGE
     assert captured["calls"] == 1
     assert captured["tools"] == []
+    run_config = cast(RunConfig, captured["run_config"])
+    assert isinstance(run_config.model_provider.get_model("gpt-test"), OpenAIResponsesModel)
     prompt = cast(str, captured["prompt"])
     assert revision in prompt
     assert trace.sha256 in prompt
@@ -759,7 +772,7 @@ async def test_candidate_synthesis_retries_invalid_experiment_binding_once(
     replacement_valid: bool,
 ) -> None:
     write_target_config(tmp_path)
-    config = HaloConfig.load(tmp_path)
+    config = replace(HaloConfig.load(tmp_path), api_mode="chat_completions")
     revision = "1" * 40
     trace = _candidate_trace(revision)
     analysis = _candidate_analysis(revision)
@@ -795,13 +808,16 @@ async def test_candidate_synthesis_retries_invalid_experiment_binding_once(
     outputs = [invalid, valid if replacement_valid else invalid]
     prompts: list[str] = []
     tool_sets: list[object] = []
+    run_configs: list[RunConfig] = []
 
-    async def run(agent: object, prompt: str, **_kwargs: object) -> object:
+    async def run(agent: object, prompt: str, **kwargs: object) -> object:
         prompts.append(prompt)
         tool_sets.append(getattr(agent, "tools"))
+        run_configs.append(cast(RunConfig, kwargs["run_config"]))
         return SimpleNamespace(final_output=outputs[len(prompts) - 1])
 
     monkeypatch.setattr("shea_halo.agent.Runner.run", run)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-runtime-key")
     actions = [
         ExecutedAction(
             index=1,
@@ -869,6 +885,13 @@ async def test_candidate_synthesis_retries_invalid_experiment_binding_once(
 
     assert len(prompts) == 2
     assert tool_sets == [[], []]
+    assert all(
+        isinstance(
+            run_config.model_provider.get_model("gpt-test"),
+            OpenAIChatCompletionsModel,
+        )
+        for run_config in run_configs
+    )
     assert "only [1]" in prompts[1]
     assert '"action_index": 2' in prompts[1]
     assert report_reference in prompts[1]
