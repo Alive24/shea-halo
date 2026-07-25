@@ -5,3 +5,9 @@ __pycache__/
 .basedpyright/
 *.pyc
 dist/
+
+# Shea Symphony: runtime output and machine-local overrides.
+.shea/logs/
+.shea/artifacts/
+.shea/worktrees/
+.shea/**/*.local.*
