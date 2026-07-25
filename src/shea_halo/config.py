@@ -5,7 +5,7 @@ import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, TypeAlias, cast
 from urllib.parse import urlsplit
 
 from shea_halo.provider import SUPPORTED_API_MODES, ApiMode
@@ -16,6 +16,7 @@ class ConfigError(ValueError):
 
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+DesktopPreflightMode: TypeAlias = Literal["disabled", "external"]
 
 
 def _table(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -134,6 +135,13 @@ def _catalyst_sdk_base_endpoint(data: dict[str, Any]) -> str:
     )
 
 
+def _desktop_preflight(data: dict[str, Any]) -> DesktopPreflightMode:
+    value = _string(data, "desktop_preflight", "disabled")
+    if value not in {"disabled", "external"}:
+        raise ConfigError("observation.desktop_preflight must be disabled or external")
+    return cast(DesktopPreflightMode, value)
+
+
 def _commands(data: dict[str, Any], table_name: str) -> tuple[tuple[str, ...], ...]:
     raw_commands = data.get("commands", [])
     if not isinstance(raw_commands, list):
@@ -198,6 +206,7 @@ class ObservationConfig:
     trace_globs: tuple[str, ...]
     desktop_report_globs: tuple[str, ...]
     catalyst_sdk_base_endpoint: str
+    desktop_preflight: DesktopPreflightMode
     require_candidate_traces: bool
 
 
@@ -295,6 +304,7 @@ class HaloConfig:
                 trace_globs=tuple(_relative_glob(item) for item in trace_globs),
                 desktop_report_globs=tuple(_relative_glob(item) for item in desktop_report_globs),
                 catalyst_sdk_base_endpoint=_catalyst_sdk_base_endpoint(observation),
+                desktop_preflight=_desktop_preflight(observation),
                 require_candidate_traces=_boolean(
                     observation,
                     "require_candidate_traces",

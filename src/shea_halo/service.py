@@ -19,6 +19,7 @@ from shea_halo.agent import (
 from shea_halo.config import HaloConfig, validate_catalyst_sdk_base_endpoint
 from shea_halo.github import GitHubClient, IssueComment, ProjectIssue, ProjectMetadata
 from shea_halo.halo_engine import HaloEngineAdapter
+from shea_halo.integrations import preflight_halo_desktop
 from shea_halo.locking import TargetLockUnavailable, target_worker_lock
 from shea_halo.models import (
     BranchSnapshot,
@@ -508,6 +509,64 @@ class HaloService:
             and head.entry.state.input_fingerprint == input_fingerprint
         ):
             return
+        desktop_preflight = None
+        if config.observation.desktop_preflight == "external":
+            # External mode owns only this public-surface check. It never
+            # discovers or manages the operator's Desktop process.
+            effective_endpoint = validate_catalyst_sdk_base_endpoint(
+                os.getenv("CATALYST_OTLP_ENDPOINT") or config.observation.catalyst_sdk_base_endpoint
+            )
+            desktop_check = await preflight_halo_desktop(
+                effective_endpoint,
+                authorization_token=os.getenv("CATALYST_OTLP_TOKEN"),
+            )
+            desktop_preflight = desktop_check.receipt
+            if not desktop_check.passed:
+                if desktop_check.blocker is None:
+                    raise ServiceError("failed Desktop preflight has no blocker")
+                result = InvestigationResult(
+                    outcome=Outcome.BLOCKED,
+                    summary="The external HALO Desktop public-surface preflight failed.",
+                    residual_risks=[
+                        (
+                            "The external Desktop preflight classified the public "
+                            f"surface as {desktop_check.receipt.classification.value!r}."
+                        )
+                    ],
+                    blocker=desktop_check.blocker,
+                    blocker_verified=True,
+                    desktop_preflight=desktop_check.receipt,
+                )
+                self._finish(
+                    config=config,
+                    github=github,
+                    metadata=metadata,
+                    issue=issue,
+                    producer=producer,
+                    head=head,
+                    state=HaloState(
+                        issue_repository=issue.repository,
+                        issue_number=issue.number,
+                        run_id=run_id,
+                        phase="blocked",
+                        api_mode=config.api_mode,
+                        workspace_branch=workspace_branch,
+                        base_revision=workspace.base_revision,
+                        branch=head.entry.state.branch,
+                        input_fingerprint=input_fingerprint,
+                        result=result,
+                    ),
+                )
+                self._log(
+                    config,
+                    issue,
+                    "desktop_preflight_blocked",
+                    {
+                        "classification": desktop_check.receipt.classification,
+                        "run_id": run_id,
+                    },
+                )
+                return
         experimenting = HaloState(
             issue_repository=issue.repository,
             issue_number=issue.number,
@@ -550,6 +609,7 @@ class HaloService:
                 prior_result=previous_result,
                 halo_analysis=halo_analysis,
             )
+            result = result.model_copy(update={"desktop_preflight": desktop_preflight})
         except ProviderApiModeError as exc:
             manager.discard_unpublished_attempt(
                 workspace,
@@ -557,7 +617,9 @@ class HaloService:
                 persisted_base_revision=workspace.base_revision,
                 expected_snapshot=head.entry.state.branch,
             )
-            result = _provider_api_mode_blocker(config.api_mode, exc)
+            result = _provider_api_mode_blocker(config.api_mode, exc).model_copy(
+                update={"desktop_preflight": desktop_preflight}
+            )
             self._finish(
                 config=config,
                 github=github,
@@ -602,6 +664,7 @@ class HaloService:
                 residual_risks=[
                     (f"{type(exc).__name__}: {sanitize_persisted_text(str(exc))[:1_000]}")
                 ],
+                desktop_preflight=desktop_preflight,
             )
             failed = HaloState(
                 issue_repository=issue.repository,
@@ -1202,6 +1265,7 @@ class HaloService:
                     failure_risks,
                     retain=failure_retained_risks,
                 ),
+                desktop_preflight=preliminary_result.desktop_preflight,
             )
             self._append(
                 github,
@@ -1254,6 +1318,7 @@ class HaloService:
             todo_handoff=decision.todo_handoff,
             blocker=decision.blocker,
             blocker_verified=False,
+            desktop_preflight=preliminary_result.desktop_preflight,
         )
         result = result.model_copy(
             update={
@@ -1819,6 +1884,7 @@ class HaloService:
                 "trace_globs": config.observation.trace_globs,
                 "desktop_report_globs": config.observation.desktop_report_globs,
                 "catalyst_sdk_base_endpoint": effective_catalyst_endpoint,
+                "desktop_preflight": config.observation.desktop_preflight,
                 "require_candidate_traces": config.observation.require_candidate_traces,
                 "experiment_environment_presence": runtime_environment,
                 "setup_commands": config.setup_commands,

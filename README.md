@@ -95,6 +95,10 @@ The interoperability boundary is OpenInference-shaped OpenTelemetry:
 
 `catalyst_sdk_base_endpoint` identifies HALO Desktop or another reachable HTTP(S) OTLP collector. It accepts either the SDK base URL or a full signal URL ending in `/v1/traces`; Halo normalizes the latter to the base because the pinned Catalyst SDK appends that route. The `CATALYST_OTLP_ENDPOINT` override follows the same rule, so the endpoint copied from HALO Desktop's own instructions works unchanged.
 
+Generic collectors remain the default: when `observation.desktop_preflight` is absent or set to `disabled`, Halo does not probe the endpoint. Operators who explicitly set `desktop_preflight = "external"` ask Halo to make one bounded pre-research check against only the derived `GET /health` and OTLP/JSON `POST /v1/traces` paths. The check follows no redirects and sends a deterministic synthetic span with no model I/O, tool data, credentials, endpoint data, or host paths. Its workpad receipt contains only the mode, allowlisted Desktop service identity, HTTP status classes, timestamps, payload digest, and pass/fail classification.
+
+External mode never starts, stops, discovers, enumerates, signals, configures, or otherwise owns the Desktop process. A successful POST is only an ingest-acceptance receipt: Halo does not read Desktop SQLite, tRPC, WebSockets, application-data paths, or trace lists, and cannot verify durable storage or UI visibility. Canonical JSONL candidate traces remain the required promotion evidence.
+
 Trace discovery covers both the observed checkout and the active experiment worktree. Each canonical record is validated against HALO Engine's public `SpanRecord` contract, including full trace/span identifiers and required span structure, before analysis begins.
 
 The investigator reads that JSON schema directly from the installed public `halo-engine` model before it designs a capture path. Shea Halo therefore does not duplicate or freeze a private canonical schema in framework-specific instructions.
@@ -138,6 +142,8 @@ trusted_producers = ["Alive24"]
 trace_globs = [".shea/artifacts/halo/traces/*.jsonl"]
 desktop_report_globs = [".shea/artifacts/halo/desktop/**/report.md"]
 catalyst_sdk_base_endpoint = "http://127.0.0.1:8799"
+# Optional: explicitly verify an already operator-managed HALO Desktop.
+# desktop_preflight = "external"
 require_candidate_traces = true
 
 [models]

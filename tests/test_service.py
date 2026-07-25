@@ -23,6 +23,9 @@ from shea_halo.models import (
     Experiment,
     ExternalBlocker,
     GuideSnapshot,
+    HaloDesktopPreflightClassification,
+    HaloDesktopPreflightReceipt,
+    HaloDesktopPreflightResult,
     HaloState,
     InvestigationResult,
     Outcome,
@@ -1055,6 +1058,186 @@ def _metadata() -> ProjectMetadata:
         status_field_id="status",
         status_options={},
     )
+
+
+def _desktop_receipt(
+    classification: HaloDesktopPreflightClassification,
+) -> HaloDesktopPreflightReceipt:
+    return HaloDesktopPreflightReceipt(
+        service=("halo-canvas-telemetry" if classification == "passed" else None),
+        health_status_class="2xx",
+        ingest_status_class="2xx",
+        started_at=datetime(2026, 7, 25, tzinfo=UTC),
+        completed_at=datetime(2026, 7, 25, 0, 0, 1, tzinfo=UTC),
+        payload_sha256="d" * 64,
+        classification=classification,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_calls"),
+    [("disabled", 0), ("external", 1)],
+)
+async def test_service_runs_desktop_preflight_only_when_explicitly_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: Literal["disabled", "external"],
+    expected_calls: int,
+) -> None:
+    write_target_config(tmp_path)
+    loaded = HaloConfig.load(tmp_path)
+    config = replace(
+        loaded,
+        observation=replace(loaded.observation, desktop_preflight=mode),
+    )
+    issue = _issue(config)
+    initial = HaloState(
+        issue_repository=config.repository,
+        issue_number=issue.number,
+        run_id="halo-20-desktop-preflight",
+        phase="research",
+        workspace_branch="halo/issue-20-improve-eve-tracing",
+        base_revision="a" * 40,
+    )
+    entry = next_entry(initial, None, producer="halo-bot")
+    github = _FakeGitHub(
+        [
+            IssueComment(
+                database_id=100,
+                author="halo-bot",
+                body=render_entry(entry, "Claimed."),
+                created_at="2026-07-25T00:00:00Z",
+            )
+        ]
+    )
+    manager = _FakeWorkspaceManager(tmp_path)
+    investigator = _FakeInvestigator()
+    preflight_calls = 0
+    validation_receipts: list[HaloDesktopPreflightReceipt | None] = []
+
+    async def preflight(*_args: object, **_kwargs: object) -> HaloDesktopPreflightResult:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        receipt = _desktop_receipt(HaloDesktopPreflightClassification.PASSED)
+        return HaloDesktopPreflightResult(passed=True, receipt=receipt)
+
+    async def validate_candidate(
+        _service: HaloService,
+        **kwargs: object,
+    ) -> None:
+        preliminary = cast(InvestigationResult, kwargs["preliminary_result"])
+        validation_receipts.append(preliminary.desktop_preflight)
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    monkeypatch.setattr("shea_halo.service.WorkspaceManager", lambda _config: manager)
+    monkeypatch.setattr("shea_halo.service.preflight_halo_desktop", preflight)
+    monkeypatch.setattr(HaloService, "_validate_candidate", validate_candidate)
+
+    await HaloService(
+        [config],
+        investigator=cast(Investigator, investigator),
+        halo_engine=cast(HaloEngineAdapter, _FakeEngine()),
+    )._process(
+        config,
+        cast(GitHubClient, github),
+        _metadata(),
+        issue,
+    )
+
+    assert preflight_calls == expected_calls
+    assert investigator.calls == 1
+    assert len(validation_receipts) == 1
+    if mode == "external":
+        assert validation_receipts[0] is not None
+        assert validation_receipts[0].classification == "passed"
+    else:
+        assert validation_receipts == [None]
+
+
+async def test_service_routes_one_sanitized_blocker_for_failed_desktop_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_target_config(tmp_path)
+    loaded = HaloConfig.load(tmp_path)
+    config = replace(
+        loaded,
+        observation=replace(loaded.observation, desktop_preflight="external"),
+    )
+    issue = _issue(config)
+    initial = HaloState(
+        issue_repository=config.repository,
+        issue_number=issue.number,
+        run_id="halo-20-desktop-preflight-failure",
+        phase="research",
+        workspace_branch="halo/issue-20-improve-eve-tracing",
+        base_revision="a" * 40,
+    )
+    entry = next_entry(initial, None, producer="halo-bot")
+    github = _FakeGitHub(
+        [
+            IssueComment(
+                database_id=100,
+                author="halo-bot",
+                body=render_entry(entry, "Claimed."),
+                created_at="2026-07-25T00:00:00Z",
+            )
+        ]
+    )
+    manager = _FakeWorkspaceManager(tmp_path)
+    investigator = _FakeInvestigator()
+    endpoint = "http://127.0.0.1:48799/private-endpoint"
+    credential = "credential-shaped-value-never-persisted"
+
+    async def rejected_preflight(
+        *_args: object,
+        **_kwargs: object,
+    ) -> HaloDesktopPreflightResult:
+        receipt = _desktop_receipt(HaloDesktopPreflightClassification.REJECTED_INGEST)
+        return HaloDesktopPreflightResult(
+            passed=False,
+            receipt=receipt,
+            blocker=ExternalBlocker(
+                category="service_unavailable",
+                description="The external Desktop rejected the synthetic OTLP/JSON trace.",
+                required_action="Repair the operator-managed public ingest surface.",
+            ),
+        )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    monkeypatch.setenv("CATALYST_OTLP_ENDPOINT", endpoint)
+    monkeypatch.setenv("CATALYST_OTLP_TOKEN", credential)
+    monkeypatch.setattr("shea_halo.service.WorkspaceManager", lambda _config: manager)
+    monkeypatch.setattr("shea_halo.service.preflight_halo_desktop", rejected_preflight)
+
+    await HaloService(
+        [config],
+        investigator=cast(Investigator, investigator),
+        halo_engine=cast(HaloEngineAdapter, _FakeEngine()),
+    )._process(
+        config,
+        cast(GitHubClient, github),
+        _metadata(),
+        issue,
+    )
+
+    assert investigator.calls == 0
+    assert github.statuses == ["Need Human Input"]
+    head = find_head(
+        github.comments,
+        repository=config.repository,
+        issue_number=issue.number,
+        trusted_producers={"halo-bot"},
+    )
+    assert head is not None
+    assert head.entry.state.result is not None
+    assert head.entry.state.result.desktop_preflight is not None
+    assert head.entry.state.result.desktop_preflight.classification == "rejected_ingest"
+    assert head.entry.state.result.blocker is not None
+    assert head.entry.state.result.blocker_verified is True
+    durable_workpad = "\n".join(comment.body for comment in github.comments)
+    assert endpoint not in durable_workpad
+    assert credential not in durable_workpad
 
 
 def test_finish_persists_pending_then_applied_status_transition(tmp_path: Path) -> None:
