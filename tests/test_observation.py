@@ -418,3 +418,23 @@ def test_duplicate_globs_do_not_duplicate_inventory_items(tmp_path: Path) -> Non
     checkpoint = inventory_observations(config, active)
 
     assert len(checkpoint.traces) == 1
+
+
+def test_inventory_attaches_provenance_aware_llm_only_semantic_receipt(
+    tmp_path: Path,
+) -> None:
+    config, active = configured_roots(tmp_path)
+    fixture = (
+        Path(__file__).parent / "fixtures" / "eve-semantics" / "synthetic-public-aggregate.jsonl"
+    )
+    trace = active.path / ".shea/artifacts/halo/traces/synthetic.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+
+    [inventory] = inventory_observations(config, active).traces
+
+    assert inventory.semantic_receipt is not None
+    assert inventory.semantic_receipt.input_tokens == 498_161
+    assert inventory.semantic_receipt.output_tokens == 22_392
+    assert inventory.semantic_receipt_sha256 is not None
+    assert inventory.semantic_receipt.span_count == inventory.span_count

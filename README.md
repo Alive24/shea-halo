@@ -116,6 +116,35 @@ HALO Engine artifacts are local and ignored under `.shea/artifacts/halo/<run-id>
 
 HALO Engine indexes and raw intermediate events live only in a per-run temporary directory. Host paths and credential-shaped values are removed before durable artifacts or public workpads are written. Live OTLP sent by the observed target to the configured Desktop or collector remains a trusted observation boundary and may contain application data; operators must secure that endpoint and choose target instrumentation deliberately.
 
+Before HALO analysis, Shea Halo projects canonical spans through a bounded,
+provenance-preserving semantic view. It recognizes documented OpenInference,
+OpenTelemetry `gen_ai.*`, Vercel AI SDK `ai.*`, and Eve `$eve.*` aliases for
+span kind, agent identity, model identity, and token usage. Identical aliases
+retain every source key; conflicting populated aliases fail closed. Token
+rollups accept complete input/output usage from attributable LLM spans only.
+Enclosing Eve workflow aggregates are never added to their child usage, while
+per-call token fields on non-LLM spans, missing parents, repeated span
+identifiers, and tokenized LLMs without an identified AGENT ancestor stop
+analysis.
+
+The resulting `analysis.json` manifest contains only bounded semantic receipts:
+safe identities and counts, source trace/span identifiers, source attribute
+keys, contribution links, and receipt digests. It does not copy raw span
+attributes, prompts, outputs, tool payloads, or endpoints.
+Consumers that already hold validated HALO Engine `SpanRecord` objects can use
+`shea_halo.trace_semantics.project_trace_semantics`; Shea Halo intentionally
+does not expose raw attribute maps through that public result.
+
+The committed fixture under `tests/fixtures/eve-semantics/` is explicitly
+synthetic. Its LLM spans sum to the accepted public FailureReport totals of
+498161 input tokens and 22392 output tokens, which proves normalization and
+arithmetic against those published aggregates. It is not evidence that the
+unavailable original FailureReport trace was parsed. Confirming that source is
+a separate Human Review/UAT action: an authorized operator must select it
+through a runtime-local path, keep it out of the repository and durable
+artifacts, and retain only safe receipt counts, identities, digests, and
+pass/fail evidence.
+
 ## Target configuration
 
 Each observed checkout commits `.shea/halo.toml`:
