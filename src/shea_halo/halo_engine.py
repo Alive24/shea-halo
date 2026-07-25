@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping
 from pydantic import BaseModel, ConfigDict
 
 from shea_halo.config import HaloConfig, validate_catalyst_sdk_base_endpoint
+from shea_halo.provider import ApiMode, OpenAIModelBootstrap
 from shea_halo.runtime_fs import RuntimeFilesystem, RuntimeFilesystemError
 from shea_halo.security import (
     PersistenceSafetyError,
@@ -52,6 +53,7 @@ class HaloAnalysisArtifact(BaseModel):
 
     schema_version: str = "shea-halo/analysis-v1"
     halo_engine_version: str
+    api_mode: ApiMode = "responses"
     dataset: TraceDatasetManifest
     prompt: str
     report_path: str
@@ -527,28 +529,39 @@ class HaloEngineAdapter:
 
             final_message = ""
             temporary_events_path = temporary_root / "events.jsonl"
+            model_bootstrap = OpenAIModelBootstrap(config.api_mode)
+            # HALO Engine 0.2.1 accepts an AsyncOpenAI connection but not the API
+            # shape. Its public entrypoint constructs OpenAIProvider on first
+            # iteration, so set the SDK's public default immediately beforehand.
+            # HaloService processes target configs serially, preventing cross-mode
+            # overlap between engine runs.
+            model_bootstrap.configure_sdk_default()
             with _halo_engine_environment(
                 config,
                 run_dir,
                 telemetry_path=raw_telemetry_path,
             ):
                 with temporary_events_path.open("w", encoding="utf-8") as events:
-                    async for item in stream_engine_output_async(
-                        [AgentMessage(role="user", content=engine_prompt)],
-                        engine_config,
-                        trace_paths,
-                        telemetry=True,
-                    ):
-                        event = _event_summary(
-                            item.model_dump(mode="json"),
-                            path_labels=path_labels,
-                        )
-                        events.write(json.dumps(event, ensure_ascii=False, sort_keys=True))
-                        events.write("\n")
-                        if item.final and item.item.role == "assistant":
-                            final_message = (
-                                item.item.content if isinstance(item.item.content, str) else ""
+                    try:
+                        async for item in stream_engine_output_async(
+                            [AgentMessage(role="user", content=engine_prompt)],
+                            engine_config,
+                            trace_paths,
+                            telemetry=True,
+                        ):
+                            event = _event_summary(
+                                item.model_dump(mode="json"),
+                                path_labels=path_labels,
                             )
+                            events.write(json.dumps(event, ensure_ascii=False, sort_keys=True))
+                            events.write("\n")
+                            if item.final and item.item.role == "assistant":
+                                final_message = (
+                                    item.item.content if isinstance(item.item.content, str) else ""
+                                )
+                    except Exception as exc:
+                        model_bootstrap.reraise_if_unsupported(exc)
+                        raise
             try:
                 runtime.atomic_write_text(
                     events_path,
@@ -573,6 +586,7 @@ class HaloEngineAdapter:
             )
             artifact = HaloAnalysisArtifact(
                 halo_engine_version=version("halo-engine"),
+                api_mode=config.api_mode,
                 dataset=dataset,
                 prompt=prompt_summary,
                 report_path="report.md",

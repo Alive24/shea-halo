@@ -5,8 +5,10 @@ import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
+
+from shea_halo.provider import SUPPORTED_API_MODES, ApiMode
 
 
 class ConfigError(ValueError):
@@ -48,6 +50,14 @@ def _bounded_positive_int(
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0 or value > maximum:
         raise ConfigError(f"{name} must be an integer from 1 to {maximum}")
     return value
+
+
+def _api_mode(data: dict[str, Any]) -> ApiMode:
+    value = _string(data, "api_mode", "responses")
+    if value not in SUPPORTED_API_MODES:
+        supported = ", ".join(repr(item) for item in SUPPORTED_API_MODES)
+        raise ConfigError(f"models.api_mode must be one of: {supported}")
+    return cast(ApiMode, value)
 
 
 def _boolean(data: dict[str, Any], name: str, default: bool) -> bool:
@@ -207,6 +217,7 @@ class HaloConfig:
     artifacts_dir: Path
     worktrees_dir: Path
     model: str
+    api_mode: ApiMode
     investigator_max_turns: int
     halo_model: str
 
@@ -303,6 +314,7 @@ class HaloConfig:
                 root, _string(runtime, "worktrees", ".shea/worktrees/halo")
             ),
             model=_string(models, "investigator", os.getenv("OPENAI_MODEL", "gpt-5.6")),
+            api_mode=_api_mode(models),
             investigator_max_turns=_bounded_positive_int(
                 models,
                 "investigator_max_turns",
