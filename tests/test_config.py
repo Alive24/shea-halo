@@ -24,6 +24,7 @@ def test_loads_minimal_target_config(tmp_path: Path) -> None:
     assert config.external_blocker_exit_codes == frozenset()
     assert config.target_environment_variables == ()
     assert config.verification_commands == (("python", "-m", "pytest"),)
+    assert config.api_mode == "responses"
     assert config.investigator_max_turns == 30
 
 
@@ -255,12 +256,17 @@ def test_complete_local_config_takes_precedence(tmp_path: Path) -> None:
         .replace(
             "[experiments]",
             '[experiments]\npass_env = ["OPENAI_API_KEY", "CATALYST_OTLP_TOKEN"]',
+        )
+        .replace(
+            "[verification]",
+            '[models]\napi_mode = "chat_completions"\n\n[verification]',
         ),
         encoding="utf-8",
     )
 
     config = HaloConfig.load(tmp_path)
     assert config.repository == "Alive24/LocalTarget"
+    assert config.api_mode == "chat_completions"
     assert config.target_environment_variables == (
         "CATALYST_OTLP_TOKEN",
         "OPENAI_API_KEY",
@@ -279,6 +285,31 @@ def test_shared_config_cannot_request_host_credentials(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ConfigError, match="only in ignored halo.local.toml"):
+        HaloConfig.load(tmp_path)
+
+
+@pytest.mark.parametrize("api_mode", ["responses", "chat_completions"])
+def test_accepts_explicit_api_modes(tmp_path: Path, api_mode: str) -> None:
+    write_target_config(tmp_path)
+    path = tmp_path / ".shea/halo.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8") + f'\n[models]\napi_mode = "{api_mode}"\n',
+        encoding="utf-8",
+    )
+
+    assert HaloConfig.load(tmp_path).api_mode == api_mode
+
+
+@pytest.mark.parametrize("value", ['"auto"', '"Responses"', "true", "1"])
+def test_rejects_unsupported_api_modes(tmp_path: Path, value: str) -> None:
+    write_target_config(tmp_path)
+    path = tmp_path / ".shea/halo.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8") + f"\n[models]\napi_mode = {value}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="api_mode"):
         HaloConfig.load(tmp_path)
 
 
@@ -326,6 +357,7 @@ def test_checked_in_failure_report_example_uses_the_three_stage_runtime_contract
 
     config = HaloConfig.load(root)
 
+    assert config.api_mode == "responses"
     assert config.setup_commands == (
         ("pnpm", "install", "--lockfile-only"),
         ("pnpm", "install", "--frozen-lockfile"),

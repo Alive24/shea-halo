@@ -38,8 +38,14 @@ from shea_halo.observation import (
     TraceObservation,
     TraceValidation,
 )
+from shea_halo.provider import ProviderApiModeError
 from shea_halo.runtime_fs import RuntimeFilesystemError
-from shea_halo.service import HaloService, ServiceError, _runtime_source_sha256
+from shea_halo.service import (
+    HaloService,
+    ServiceError,
+    _provider_api_mode_blocker,
+    _runtime_source_sha256,
+)
 from shea_halo.workpad import WorkpadHead, find_head, next_entry, render_entry
 from shea_halo.workspace import HaloWorkspace, WorkspaceManager
 
@@ -573,6 +579,13 @@ def test_reentry_input_fingerprint_is_stable_and_tracks_new_discussion(
         checkpoint=checkpoint,
         branch=branch,
     )
+    with_chat_completions = HaloService._input_fingerprint(
+        config=replace(config, api_mode="chat_completions"),
+        issue=issue,
+        discussion="[]",
+        checkpoint=checkpoint,
+        branch=branch,
+    )
     monkeypatch.setattr("shea_halo.service._RUNTIME_SOURCE_SHA256", "b" * 64)
     with_updated_runtime = HaloService._input_fingerprint(
         config=config,
@@ -587,7 +600,22 @@ def test_reentry_input_fingerprint_is_stable_and_tracks_new_discussion(
     assert first != with_runtime_handle
     assert with_runtime_handle != with_endpoint_override
     assert with_endpoint_override != with_larger_turn_budget
+    assert first != with_chat_completions
     assert with_endpoint_override != with_updated_runtime
+
+
+def test_provider_api_mode_blocker_is_structured_and_never_falls_back() -> None:
+    result = _provider_api_mode_blocker(
+        "chat_completions",
+        ProviderApiModeError("chat_completions", 404),
+    )
+
+    assert result.outcome == Outcome.BLOCKED
+    assert result.blocker is not None
+    assert result.blocker.category == "service_unavailable"
+    assert result.blocker_verified is True
+    assert "chat_completions" in result.blocker.description
+    assert "other API mode" in result.residual_risks[0]
 
 
 def test_discussion_context_ignores_workpad_and_sanitizes_public_input() -> None:

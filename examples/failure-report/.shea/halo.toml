@@ -21,6 +21,9 @@ desktop_report_globs = [".shea/artifacts/halo/desktop/**/report.md"]
 catalyst_sdk_base_endpoint = "http://127.0.0.1:8799"
 require_candidate_traces = true
 
+[models]
+api_mode = "responses"
+
 [setup]
 commands = [
   ["pnpm", "install", "--lockfile-only"],

@@ -169,6 +169,9 @@ desktop_report_globs = [".shea/artifacts/halo/desktop/**/report.md"]
 catalyst_sdk_base_endpoint = "http://127.0.0.1:8799"
 require_candidate_traces = true
 
+[models]
+api_mode = "responses"
+
 [setup]
 commands = [
   ["pnpm", "install", "--lockfile-only"],
@@ -196,7 +199,7 @@ A framework-neutral Issue starting point is at [`examples/halo-research-issue.md
 
 Optional `[runtime]` paths default to `.shea/logs/halo`, `.shea/artifacts/halo`, and `.shea/worktrees/halo`. Runtime paths must remain below the target's `.shea/` directory and cannot escape through symlinks.
 
-Optional `[models]` keys `investigator` and `halo` default to `OPENAI_MODEL`, `HALO_MODEL`, then `gpt-5.6`. `investigator_max_turns` defaults to `30` and may be set from `1` through `100`; increase it only when a repository-scale experiment genuinely needs more tool iterations. If that bound is reached after files changed, Halo uses the Agents SDK max-turn handler to checkpoint the changes as an experimental snapshot, runs exact-revision validation, and keeps the item in research instead of discarding useful work or claiming completion. The budget participates in re-entry fingerprinting, so changing it makes a failed research attempt immediately eligible for another pass.
+Optional `[models]` keys `investigator` and `halo` default to `OPENAI_MODEL`, `HALO_MODEL`, then `gpt-5.6`. `api_mode` accepts `responses` (the default) or `chat_completions`; the selected mode is applied explicitly to investigator, synthesis, correction, and HALO Engine calls without fallback. The non-secret mode is recorded in re-entry fingerprints, workpad state, and HALO analysis manifests, while provider endpoints and credentials remain runtime-only. `investigator_max_turns` defaults to `30` and may be set from `1` through `100`; increase it only when a repository-scale experiment genuinely needs more tool iterations. If that bound is reached after files changed, Halo uses the Agents SDK max-turn handler to checkpoint the changes as an experimental snapshot, runs exact-revision validation, and keeps the item in research instead of discarding useful work or claiming completion. The budget participates in re-entry fingerprinting, so changing it makes a failed research attempt immediately eligible for another pass.
 
 For machine-local onboarding, a complete ignored `.shea/halo.local.toml` takes precedence over the shared file. It is a full replacement, so the effective contract always has one unambiguous source.
 

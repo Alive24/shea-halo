@@ -10,7 +10,6 @@ from typing import Literal, TypeAlias
 
 from agents import (
     Agent,
-    RunConfig,
     RunErrorHandlerInput,
     RunErrorHandlerResult,
     Runner,
@@ -42,6 +41,7 @@ from shea_halo.models import (
     Verification,
 )
 from shea_halo.observation import TraceObservation, TraceValidation
+from shea_halo.provider import OpenAIModelBootstrap
 from shea_halo.security import (
     is_sensitive_path,
     redact_text,
@@ -286,6 +286,7 @@ class Investigator:
             ),
             service_name=os.getenv("CATALYST_SERVICE_NAME") or "shea-halo",
         )
+        model_bootstrap = OpenAIModelBootstrap(config.api_mode)
         try:
             with agent_span(
                 tracing.tracer,
@@ -302,12 +303,16 @@ class Investigator:
                 span.set_attribute("shea.candidate.revision", candidate_revision)
                 decision: AgentDecision | None = None
                 for attempt in range(2):
-                    result = await Runner.run(
-                        agent,
-                        prompt,
-                        max_turns=3,
-                        run_config=RunConfig(tracing_disabled=True),
-                    )
+                    try:
+                        result = await Runner.run(
+                            agent,
+                            prompt,
+                            max_turns=3,
+                            run_config=model_bootstrap.run_config(),
+                        )
+                    except Exception as exc:
+                        model_bootstrap.reraise_if_unsupported(exc)
+                        raise
                     candidate = result.final_output
                     if not isinstance(candidate, AgentDecision):
                         raise InvestigationError(
@@ -641,6 +646,7 @@ class Investigator:
             ),
             service_name=os.getenv("CATALYST_SERVICE_NAME") or "shea-halo",
         )
+        model_bootstrap = OpenAIModelBootstrap(config.api_mode)
         try:
             with agent_span(
                 tracing.tracer,
@@ -655,13 +661,17 @@ class Investigator:
                 span.set_attribute("shea.target.repository", config.repository)
                 span.set_attribute("shea.issue.number", issue_number)
                 span.set_attribute("shea.halo.run_id", run_id)
-                result = await Runner.run(
-                    agent,
-                    prompt,
-                    max_turns=config.investigator_max_turns,
-                    run_config=RunConfig(tracing_disabled=True),
-                    error_handlers={"max_turns": checkpoint_at_turn_limit},
-                )
+                try:
+                    result = await Runner.run(
+                        agent,
+                        prompt,
+                        max_turns=config.investigator_max_turns,
+                        run_config=model_bootstrap.run_config(),
+                        error_handlers={"max_turns": checkpoint_at_turn_limit},
+                    )
+                except Exception as exc:
+                    model_bootstrap.reraise_if_unsupported(exc)
+                    raise
                 decision = result.final_output
                 if not isinstance(decision, AgentDecision):
                     raise InvestigationError("investigator returned an invalid structured result")

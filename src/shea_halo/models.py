@@ -7,6 +7,7 @@ from typing import Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from shea_halo.observation import ObservationCheckpoint, TraceValidation
+from shea_halo.provider import ApiMode
 
 
 class StrictModel(BaseModel):
@@ -169,6 +170,7 @@ class HaloState(StrictModel):
     issue_number: int
     run_id: str
     phase: Phase
+    api_mode: ApiMode = "responses"
     workspace_branch: str
     base_revision: str | None = None
     branch: BranchSnapshot | None = None

@@ -38,6 +38,7 @@ from shea_halo.observation import (
     discard_worktree_observation_changes,
     inventory_observations,
 )
+from shea_halo.provider import ApiMode, ProviderApiModeError
 from shea_halo.runtime_fs import append_runtime_text
 from shea_halo.security import sanitize_persisted_data, sanitize_persisted_text
 from shea_halo.workpad import (
@@ -120,6 +121,42 @@ def _validated_result_with_residual_risks(
         }
     )
     return InvestigationResult.model_validate(updated.model_dump())
+
+
+def _provider_api_mode_blocker(
+    api_mode: ApiMode,
+    error: ProviderApiModeError,
+    *,
+    previous: InvestigationResult | None = None,
+) -> InvestigationResult:
+    risk = (
+        f"The configured {api_mode!r} provider route returned HTTP {error.status_code}; "
+        "Halo did not try the other API mode."
+    )
+    update = {
+        "outcome": Outcome.BLOCKED,
+        "summary": f"The configured provider does not expose the {api_mode!r} API mode.",
+        "residual_risks": _bounded_residual_risks(
+            (
+                *(previous.residual_risks if previous is not None else ()),
+                risk,
+            ),
+            retain=(risk,),
+        ),
+        "todo_handoff": None,
+        "blocker": ExternalBlocker(
+            category="service_unavailable",
+            description=f"The configured provider rejected the {api_mode!r} API route.",
+            required_action=(
+                "Configure models.api_mode to a route the runtime provider supports, "
+                "or select a compatible provider, then return the item to Halo Research."
+            ),
+        ),
+        "blocker_verified": True,
+    }
+    if previous is None:
+        return InvestigationResult(**update)
+    return InvestigationResult.model_validate(previous.model_copy(update=update).model_dump())
 
 
 class HaloService:
@@ -216,6 +253,7 @@ class HaloService:
                 issue_number=issue.number,
                 run_id=run_id,
                 phase="research",
+                api_mode=config.api_mode,
                 workspace_branch=workspace_branch,
             )
             head = self._append(
@@ -248,6 +286,7 @@ class HaloService:
                 issue_number=issue.number,
                 run_id=run_id,
                 phase="research",
+                api_mode=config.api_mode,
                 workspace_branch=workspace_branch,
                 base_revision=persisted_base,
                 branch=head.entry.state.branch,
@@ -299,6 +338,7 @@ class HaloService:
                 issue_number=issue.number,
                 run_id=run_id,
                 phase="validating",
+                api_mode=config.api_mode,
                 workspace_branch=workspace_branch,
                 base_revision=workspace.base_revision,
                 branch=snapshot,
@@ -398,6 +438,7 @@ class HaloService:
                 issue_number=issue.number,
                 run_id=run_id,
                 phase="blocked",
+                api_mode=config.api_mode,
                 workspace_branch=workspace_branch,
                 base_revision=head.entry.state.base_revision,
                 branch=head.entry.state.branch,
@@ -445,6 +486,7 @@ class HaloService:
                     issue_number=issue.number,
                     run_id=run_id,
                     phase="blocked",
+                    api_mode=config.api_mode,
                     workspace_branch=workspace_branch,
                     base_revision=workspace.base_revision,
                     branch=head.entry.state.branch,
@@ -471,6 +513,7 @@ class HaloService:
             issue_number=issue.number,
             run_id=run_id,
             phase="experimenting",
+            api_mode=config.api_mode,
             workspace_branch=workspace_branch,
             base_revision=workspace.base_revision,
             branch=head.entry.state.branch,
@@ -507,6 +550,45 @@ class HaloService:
                 prior_result=previous_result,
                 halo_analysis=halo_analysis,
             )
+        except ProviderApiModeError as exc:
+            manager.discard_unpublished_attempt(
+                workspace,
+                issue_number=issue.number,
+                persisted_base_revision=workspace.base_revision,
+                expected_snapshot=head.entry.state.branch,
+            )
+            result = _provider_api_mode_blocker(config.api_mode, exc)
+            self._finish(
+                config=config,
+                github=github,
+                metadata=metadata,
+                issue=issue,
+                producer=producer,
+                head=head,
+                state=HaloState(
+                    issue_repository=issue.repository,
+                    issue_number=issue.number,
+                    run_id=run_id,
+                    phase="blocked",
+                    api_mode=config.api_mode,
+                    workspace_branch=workspace_branch,
+                    base_revision=workspace.base_revision,
+                    branch=head.entry.state.branch,
+                    input_fingerprint=input_fingerprint,
+                    result=result,
+                ),
+            )
+            self._log(
+                config,
+                issue,
+                "provider_api_mode_blocked",
+                {
+                    "api_mode": config.api_mode,
+                    "status_code": exc.status_code,
+                    "run_id": run_id,
+                },
+            )
+            return
         except Exception as exc:
             manager.discard_unpublished_attempt(
                 workspace,
@@ -526,6 +608,7 @@ class HaloService:
                 issue_number=issue.number,
                 run_id=run_id,
                 phase="research",
+                api_mode=config.api_mode,
                 workspace_branch=workspace_branch,
                 base_revision=workspace.base_revision,
                 branch=head.entry.state.branch,
@@ -574,6 +657,7 @@ class HaloService:
                 issue_number=issue.number,
                 run_id=run_id,
                 phase="experimenting",
+                api_mode=config.api_mode,
                 workspace_branch=workspace_branch,
                 base_revision=workspace.base_revision,
                 branch=snapshot,
@@ -610,6 +694,7 @@ class HaloService:
             issue_number=issue.number,
             run_id=run_id,
             phase="validating",
+            api_mode=config.api_mode,
             workspace_branch=workspace_branch,
             base_revision=workspace.base_revision,
             branch=snapshot,
@@ -836,6 +921,7 @@ class HaloService:
                         issue_number=issue.number,
                         run_id=run_id,
                         phase="blocked",
+                        api_mode=config.api_mode,
                         workspace_branch=workspace_branch,
                         base_revision=workspace.base_revision,
                         branch=snapshot,
@@ -876,6 +962,7 @@ class HaloService:
                 issue_number=issue.number,
                 run_id=run_id,
                 phase="research",
+                api_mode=config.api_mode,
                 workspace_branch=workspace_branch,
                 base_revision=workspace.base_revision,
                 branch=snapshot,
@@ -923,14 +1010,57 @@ class HaloService:
 
         post_analysis = None
         if candidate_traces:
-            post_analysis = await self.halo_engine.analyze(
-                config=config,
-                workspace=workspace,
-                run_id=f"{run_id}-candidate",
-                issue_title=issue.title,
-                issue_body=issue.body,
-                trace_sha256s=frozenset(trace.sha256 for trace in candidate_traces),
-            )
+            try:
+                post_analysis = await self.halo_engine.analyze(
+                    config=config,
+                    workspace=workspace,
+                    run_id=f"{run_id}-candidate",
+                    issue_title=issue.title,
+                    issue_body=issue.body,
+                    trace_sha256s=frozenset(trace.sha256 for trace in candidate_traces),
+                )
+            except ProviderApiModeError as exc:
+                manager.prepare_validation_workspace(
+                    workspace,
+                    issue_number=issue.number,
+                    persisted_base_revision=workspace.base_revision,
+                    expected_snapshot=snapshot,
+                )
+                blocked = _provider_api_mode_blocker(
+                    config.api_mode,
+                    exc,
+                    previous=preliminary_result,
+                )
+                self._finish(
+                    config=config,
+                    github=github,
+                    metadata=metadata,
+                    issue=issue,
+                    producer=producer,
+                    head=head,
+                    state=HaloState(
+                        issue_repository=issue.repository,
+                        issue_number=issue.number,
+                        run_id=run_id,
+                        phase="blocked",
+                        api_mode=config.api_mode,
+                        workspace_branch=workspace_branch,
+                        base_revision=workspace.base_revision,
+                        branch=snapshot,
+                        result=blocked,
+                    ),
+                )
+                self._log(
+                    config,
+                    issue,
+                    "provider_api_mode_blocked",
+                    {
+                        "api_mode": config.api_mode,
+                        "status_code": exc.status_code,
+                        "run_id": run_id,
+                    },
+                )
+                return
 
         analysis_sha256 = None
         trace_validation = TraceValidation(
@@ -985,6 +1115,48 @@ class HaloService:
                 candidate_traces=candidate_traces,
                 validation_actions=validation_actions,
             )
+        except ProviderApiModeError as exc:
+            manager.prepare_validation_workspace(
+                workspace,
+                issue_number=issue.number,
+                persisted_base_revision=workspace.base_revision,
+                expected_snapshot=snapshot,
+            )
+            blocked = _provider_api_mode_blocker(
+                config.api_mode,
+                exc,
+                previous=preliminary_result,
+            )
+            self._finish(
+                config=config,
+                github=github,
+                metadata=metadata,
+                issue=issue,
+                producer=producer,
+                head=head,
+                state=HaloState(
+                    issue_repository=issue.repository,
+                    issue_number=issue.number,
+                    run_id=run_id,
+                    phase="blocked",
+                    api_mode=config.api_mode,
+                    workspace_branch=workspace_branch,
+                    base_revision=workspace.base_revision,
+                    branch=snapshot,
+                    result=blocked,
+                ),
+            )
+            self._log(
+                config,
+                issue,
+                "provider_api_mode_blocked",
+                {
+                    "api_mode": config.api_mode,
+                    "status_code": exc.status_code,
+                    "run_id": run_id,
+                },
+            )
+            return
         except Exception as exc:
             manager.prepare_validation_workspace(
                 workspace,
@@ -1041,6 +1213,7 @@ class HaloService:
                     issue_number=issue.number,
                     run_id=run_id,
                     phase="research",
+                    api_mode=config.api_mode,
                     workspace_branch=workspace_branch,
                     base_revision=workspace.base_revision,
                     branch=snapshot,
@@ -1183,6 +1356,7 @@ class HaloService:
             issue_number=issue.number,
             run_id=run_id,
             phase=phase,
+            api_mode=config.api_mode,
             workspace_branch=workspace_branch,
             base_revision=workspace.base_revision,
             branch=snapshot,
@@ -1652,6 +1826,7 @@ class HaloService:
                 "external_blocker_exit_codes": sorted(config.external_blocker_exit_codes),
                 "verification_commands": config.verification_commands,
                 "model": config.model,
+                "api_mode": config.api_mode,
                 "investigator_max_turns": config.investigator_max_turns,
                 "halo_model": config.halo_model,
             },
