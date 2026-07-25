@@ -1156,6 +1156,30 @@ def candidate_synthesis_prompt(
                 }
                 for item in dataset_files
             ],
+            "semantic_projection": {
+                "complete": (
+                    getattr(dataset, "semantic_projection_complete", False)
+                    if dataset is not None
+                    else False
+                ),
+                "input_tokens": (getattr(dataset, "input_tokens", 0) if dataset is not None else 0),
+                "output_tokens": (
+                    getattr(dataset, "output_tokens", 0) if dataset is not None else 0
+                ),
+                "agent_identities": (
+                    getattr(dataset, "agent_identities", ()) if dataset is not None else ()
+                ),
+                "receipts": [
+                    receipt.model_dump(mode="json")
+                    for item in dataset_files
+                    if (receipt := getattr(item, "semantic_receipt", None)) is not None
+                ],
+                "receipt_sha256s": [
+                    digest
+                    for item in dataset_files
+                    if (digest := getattr(item, "semantic_receipt_sha256", None)) is not None
+                ],
+            },
             "required_report_source": report_reference,
             "candidate_trace_sources": trace_references,
         },

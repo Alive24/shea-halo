@@ -31,6 +31,12 @@ _COMMON_SENSITIVE_NAMES = {
     "SSH_AUTH_SOCK",
 }
 _SAFE_GIT_AUTH_HANDLES = {"GIT_ASKPASS", "SSH_ASKPASS", "SSH_AUTH_SOCK"}
+_SAFE_NUMERIC_TELEMETRY_FIELDS = {
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+}
+_TELEMETRY_ATTRIBUTE_KEY = re.compile(r"^\$?[A-Za-z][A-Za-z0-9_.]{0,127}$")
 _SENSITIVE_PATH_NAMES = {
     ".git-credentials",
     ".netrc",
@@ -153,6 +159,43 @@ def _is_sensitive_name(name: str) -> bool:
     normalized = name.upper()
     return normalized in _COMMON_SENSITIVE_NAMES or any(
         marker in normalized for marker in _SENSITIVE_NAME_PARTS
+    )
+
+
+def _is_safe_numeric_telemetry(name: str, value: Any) -> bool:
+    """Keep explicit aggregate counts without weakening credential-name redaction."""
+
+    if name.casefold() not in _SAFE_NUMERIC_TELEMETRY_FIELDS:
+        return False
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value >= 0
+    if not isinstance(value, Mapping) or set(value) != {"value", "sources"}:
+        return False
+    count = value.get("value")
+    sources = value.get("sources")
+    return (
+        isinstance(count, int)
+        and not isinstance(count, bool)
+        and count >= 0
+        and isinstance(sources, (list, tuple))
+        and 0 < len(sources) <= 8
+        and all(
+            isinstance(source, Mapping)
+            and set(source) == {"trace_id", "span_id", "source_key"}
+            and all(isinstance(item, str) for item in source.values())
+            for source in sources
+        )
+    )
+
+
+def _is_safe_telemetry_provenance(name: str, value: Any) -> bool:
+    """Allow an attribute name as provenance, never an arbitrary attribute value."""
+
+    return (
+        name.casefold() == "source_key"
+        and isinstance(value, str)
+        and bool(_TELEMETRY_ATTRIBUTE_KEY.fullmatch(value))
+        and not contains_sensitive_text(value, {})
     )
 
 
@@ -330,7 +373,13 @@ def redact_data(value: Any, environment: Mapping[str, str] | None = None) -> Any
         redacted: dict[str, Any] = {}
         for raw_key, item in value.items():
             key = str(raw_key)
-            redacted[key] = REDACTED if _is_sensitive_name(key) else redact_data(item, environment)
+            redacted[key] = (
+                REDACTED
+                if _is_sensitive_name(key)
+                and not _is_safe_numeric_telemetry(key, item)
+                and not _is_safe_telemetry_provenance(key, item)
+                else redact_data(item, environment)
+            )
         return redacted
     if isinstance(value, (list, tuple)):
         return [redact_data(item, environment) for item in value]
@@ -362,6 +411,8 @@ def sanitize_persisted_data(
             sanitized[key] = (
                 REDACTED
                 if _is_sensitive_name(key)
+                and not _is_safe_numeric_telemetry(key, item)
+                and not _is_safe_telemetry_provenance(key, item)
                 else sanitize_persisted_data(
                     item,
                     path_labels=path_labels,

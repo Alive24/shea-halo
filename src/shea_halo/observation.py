@@ -14,6 +14,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from shea_halo.config import HaloConfig
 from shea_halo.runtime_fs import RuntimeFilesystem, RuntimeFilesystemError
+from shea_halo.trace_semantics import (
+    SemanticProjectionError,
+    TraceSemanticReceipt,
+    project_trace_semantics,
+    semantic_receipt_sha256,
+)
 
 if TYPE_CHECKING:
     from shea_halo.workspace import HaloWorkspace
@@ -75,6 +81,8 @@ class TraceObservation(FileObservation):
     span_kinds: tuple[SpanKindCount, ...]
     service_version_span_count: int = Field(default=0, ge=0)
     service_versions: tuple[str, ...] = ()
+    semantic_receipt: TraceSemanticReceipt | None = None
+    semantic_receipt_sha256: str | None = None
 
     @model_validator(mode="after")
     def _consistent_summary(self) -> TraceObservation:
@@ -95,6 +103,15 @@ class TraceObservation(FileObservation):
             raise ValueError(
                 "service_version_span_count and service_versions must both be present or absent"
             )
+        if bool(self.semantic_receipt) != bool(self.semantic_receipt_sha256):
+            raise ValueError(
+                "semantic_receipt and semantic_receipt_sha256 must both be present or absent"
+            )
+        if self.semantic_receipt is not None:
+            if self.semantic_receipt.span_count != self.span_count:
+                raise ValueError("semantic receipt must account for every observed span")
+            if semantic_receipt_sha256(self.semantic_receipt) != self.semantic_receipt_sha256:
+                raise ValueError("semantic receipt digest does not match its canonical content")
         return self
 
 
@@ -452,6 +469,7 @@ def _inventory_trace(path: Path, label: str) -> TraceObservation:
     span_kinds: Counter[str] = Counter()
     service_versions: set[str] = set()
     service_version_span_count = 0
+    spans: list[SpanRecord] = []
 
     source, before = _open_stable(path, label)
     try:
@@ -489,6 +507,7 @@ def _inventory_trace(path: Path, label: str) -> TraceObservation:
                     f"trace has a duplicate span identifier at {label}:{line_number}"
                 )
             span_ids.add(identity)
+            spans.append(span)
             trace_ids.add(span.trace_id.lower())
             span_count += 1
             if span.parent_span_id:
@@ -530,6 +549,15 @@ def _inventory_trace(path: Path, label: str) -> TraceObservation:
                 raise ObservationError(f"trace contains a parent cycle: {label}")
             visited.add(cursor)
             cursor = parent_links[cursor]
+    try:
+        semantic_receipt = project_trace_semantics(spans)
+    except SemanticProjectionError as exc:
+        evidence = exc.evidence
+        keys = ",".join(evidence.source_keys) or "<topology>"
+        raise ObservationError(
+            "trace semantic projection failed closed at "
+            f"{label}:{evidence.span_id} ({evidence.kind}; {keys})"
+        ) from exc
     return TraceObservation(
         label=label,
         sha256=digest.hexdigest(),
@@ -542,4 +570,6 @@ def _inventory_trace(path: Path, label: str) -> TraceObservation:
         ),
         service_version_span_count=service_version_span_count,
         service_versions=tuple(sorted(service_versions)),
+        semantic_receipt=semantic_receipt,
+        semantic_receipt_sha256=semantic_receipt_sha256(semantic_receipt),
     )
