@@ -10,7 +10,11 @@ public FailureReport aggregate of 498161 input tokens and 22392 output tokens.
 It proves Shea Halo's normalization, provenance, topology, and arithmetic
 behavior against those published numbers. It was not copied, exported, or
 derived from the original trace, and it is not evidence that Shea Halo parsed
-that unavailable source.
+that unavailable source. Its nested AGENT, LLM, and TOOL spans also carry
+synthetic inherited `$eve.type=turn` context so the turn marker cannot
+reclassify child operations. The AGENT spans repeat their directly attributable
+LLM totals, proving those enclosing aggregates are verified and excluded rather
+than added to the LLM-only rollup.
 
 The remaining files isolate identical aliases, conflicting aliases, absent
 optional model metadata, ambiguous agent attribution, and an enclosing AGENT

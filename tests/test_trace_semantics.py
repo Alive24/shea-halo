@@ -70,6 +70,10 @@ def test_synthetic_public_aggregate_is_llm_only_and_provenance_preserving() -> N
     assert {source.source_key for source in receipt.contributions[2].input_tokens.sources} == {
         "ai.usage.inputTokens"
     }
+    assert all(
+        "$eve.type" not in {source.source_key for source in item.span_kind.sources}
+        for item in (*receipt.agents, *receipt.contributions)
+    )
 
 
 def test_eve_enclosing_aggregate_is_not_a_token_contribution() -> None:
@@ -80,6 +84,49 @@ def test_eve_enclosing_aggregate_is_not_a_token_contribution() -> None:
     }
     assert sum(item.input_tokens.value for item in receipt.contributions) == 498_161
     assert sum(item.output_tokens.value for item in receipt.contributions) == 22_392
+
+
+def test_eve_agent_aggregate_must_match_directly_attributable_llms() -> None:
+    spans = load_spans("synthetic-public-aggregate.jsonl")
+    spans[1] = spans[1].model_copy(
+        update={
+            "attributes": {
+                **spans[1].attributes,
+                "llm.token_count.prompt": 100_001,
+                "gen_ai.usage.input_tokens": 100_001,
+            }
+        }
+    )
+
+    with pytest.raises(SemanticProjectionError) as raised:
+        project_trace_semantics(spans)
+
+    assert raised.value.evidence.kind == "ambiguous_token_ownership"
+    assert raised.value.evidence.field == "input_tokens"
+    assert raised.value.evidence.related_span_ids == ("0000000000000003",)
+
+
+def test_leaf_agent_gen_ai_usage_is_a_noncontributing_aggregate() -> None:
+    [agent, _llm] = load_spans("parent-child-double-count.jsonl")
+    agent = agent.model_copy(
+        update={
+            "attributes": {
+                "openinference.span.kind": "AGENT",
+                "gen_ai.operation.name": "invoke_agent",
+                "agent.name": "bounded-agent-aggregate",
+                "gen_ai.usage.input_tokens": 55,
+                "gen_ai.usage.output_tokens": 9,
+            }
+        }
+    )
+
+    receipt = project_trace_semantics([agent])
+
+    assert receipt.input_tokens == 0
+    assert receipt.output_tokens == 0
+    assert receipt.contributions == ()
+    assert receipt.agents[0].identity is not None
+    assert receipt.agents[0].identity.value == "bounded-agent-aggregate"
 
 
 def test_identical_duplicate_aliases_are_accepted_without_double_counting() -> None:

@@ -111,6 +111,11 @@ _NON_AGGREGATE_TOKEN_KEYS = frozenset(
         *_TOTAL_TOKEN_KEYS,
     )
 )
+_GEN_AI_USAGE_TOKEN_KEYS = frozenset(
+    key
+    for key in (*_INPUT_TOKEN_KEYS, *_OUTPUT_TOKEN_KEYS, *_TOTAL_TOKEN_KEYS)
+    if key.startswith("gen_ai.usage.")
+)
 
 _OPERATION_KINDS: dict[str, SemanticSpanKind] = {
     "invoke_agent": "AGENT",
@@ -638,7 +643,12 @@ def _kind_candidates(span: SpanRecord) -> list[tuple[str, SemanticSpanKind]]:
     if span.name in _NATIVE_NAME_KINDS:
         candidates.append(("name", _NATIVE_NAME_KINDS[span.name]))
     if attributes.get("$eve.type") == "turn":
-        candidates.append(("$eve.type", "CHAIN"))
+        # Eve propagates turn context to nested AGENT, LLM, and TOOL spans.
+        # Treat it as a span-kind signal only when no child-specific signal
+        # exists, or when every other signal already identifies a CHAIN.
+        candidate_kinds = {kind for _, kind in candidates}
+        if not candidate_kinds or candidate_kinds == {"CHAIN"}:
+            candidates.append(("$eve.type", "CHAIN"))
     return candidates
 
 
@@ -762,10 +772,12 @@ def project_trace_semantics(spans: Iterable[SpanRecord]) -> TraceSemanticReceipt
         )
     _validate_topology(source_spans)
     projected: dict[tuple[str, str], _ProjectedSpan] = {}
+    eve_agent_aggregate_identities: set[tuple[str, str]] = set()
     agents: list[AgentAttribution] = []
 
     for span in source_spans:
         attributes = _combined_attributes(span)
+        identity = (span.trace_id.lower(), span.span_id.lower())
         kind = _resolve_kind(span)
         agent_id = _resolve_string(span, attributes, _AGENT_ID_KEYS, field="agent_id")
         agent_name = _resolve_string(span, attributes, _AGENT_NAME_KEYS, field="agent_name")
@@ -805,14 +817,42 @@ def project_trace_semantics(spans: Iterable[SpanRecord]) -> TraceSemanticReceipt
             if attributes.get(key) is not None
         }
         kind_value = kind.value if kind is not None else None
-        if kind_value != "LLM" and populated_token_keys.intersection(_NON_AGGREGATE_TOKEN_KEYS):
-            raise _conflict(
-                span,
-                kind="ambiguous_token_ownership",
-                field="span_kind",
-                source_keys=populated_token_keys,
-                message="non-LLM span exposes per-call token aliases",
+        non_aggregate_token_keys = populated_token_keys.intersection(_NON_AGGREGATE_TOKEN_KEYS)
+        if kind_value != "LLM" and non_aggregate_token_keys:
+            is_eve_agent_aggregate = kind_value == "AGENT" and attributes.get("$eve.type") == "turn"
+            is_gen_ai_agent_aggregate = (
+                kind_value == "AGENT"
+                and attributes.get("gen_ai.operation.name") == "invoke_agent"
+                and non_aggregate_token_keys.issubset(_GEN_AI_USAGE_TOKEN_KEYS)
             )
+            if not is_eve_agent_aggregate and not is_gen_ai_agent_aggregate:
+                raise _conflict(
+                    span,
+                    kind="ambiguous_token_ownership",
+                    field="span_kind",
+                    source_keys=populated_token_keys,
+                    message="non-LLM span exposes per-call token aliases",
+                )
+            if input_tokens is None or output_tokens is None:
+                raise _conflict(
+                    span,
+                    kind="incomplete_token_usage",
+                    field="input_tokens" if input_tokens is None else "output_tokens",
+                    source_keys=populated_token_keys,
+                    message="Eve agent aggregate must include complete input and output counts",
+                )
+            if total_tokens is not None and (
+                total_tokens.value != input_tokens.value + output_tokens.value
+            ):
+                raise _conflict(
+                    span,
+                    kind="alias_conflict",
+                    field="total_tokens",
+                    source_keys=populated_token_keys,
+                    message="Eve agent aggregate total disagrees with input plus output",
+                )
+            if is_eve_agent_aggregate:
+                eve_agent_aggregate_identities.add(identity)
         if kind_value == "LLM":
             if (input_tokens is None) != (output_tokens is None):
                 raise _conflict(
@@ -839,7 +879,6 @@ def project_trace_semantics(spans: Iterable[SpanRecord]) -> TraceSemanticReceipt
                         source_keys=populated_token_keys,
                         message="LLM total tokens disagree with input plus output",
                     )
-        identity = (span.trace_id.lower(), span.span_id.lower())
         projected[identity] = _ProjectedSpan(
             span=span,
             kind=kind,
@@ -850,6 +889,74 @@ def project_trace_semantics(spans: Iterable[SpanRecord]) -> TraceSemanticReceipt
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
+
+    for aggregate_identity in sorted(eve_agent_aggregate_identities):
+        aggregate = projected[aggregate_identity]
+        assert aggregate.input_tokens is not None
+        assert aggregate.output_tokens is not None
+        directly_attributed_llms: list[_ProjectedSpan] = []
+        for candidate_identity, candidate in projected.items():
+            if (
+                candidate_identity[0] != aggregate_identity[0]
+                or candidate.kind is None
+                or candidate.kind.value != "LLM"
+                or candidate.input_tokens is None
+                or candidate.output_tokens is None
+            ):
+                continue
+            cursor = candidate.span.parent_span_id.lower() if candidate.span.parent_span_id else ""
+            while cursor:
+                parent_identity = (candidate_identity[0], cursor)
+                parent = projected[parent_identity]
+                if parent.kind is not None and parent.kind.value == "AGENT":
+                    if parent_identity == aggregate_identity:
+                        directly_attributed_llms.append(candidate)
+                    break
+                cursor = parent.span.parent_span_id.lower() if parent.span.parent_span_id else ""
+        aggregate_attributes = _combined_attributes(aggregate.span)
+        aggregate_source_keys = {
+            key
+            for key in (*_INPUT_TOKEN_KEYS, *_OUTPUT_TOKEN_KEYS, *_TOTAL_TOKEN_KEYS)
+            if aggregate_attributes.get(key) is not None
+        }
+        if not directly_attributed_llms:
+            raise _conflict(
+                aggregate.span,
+                kind="ambiguous_token_ownership",
+                field="parent_span_id",
+                source_keys=aggregate_source_keys,
+                message="Eve agent aggregate has no directly attributable LLM descendants",
+            )
+        descendant_input = sum(
+            item.input_tokens.value
+            for item in directly_attributed_llms
+            if item.input_tokens is not None
+        )
+        descendant_output = sum(
+            item.output_tokens.value
+            for item in directly_attributed_llms
+            if item.output_tokens is not None
+        )
+        if aggregate.input_tokens.value != descendant_input:
+            raise _conflict(
+                aggregate.span,
+                kind="ambiguous_token_ownership",
+                field="input_tokens",
+                source_keys=aggregate_source_keys,
+                related_span_ids=(item.span.span_id for item in directly_attributed_llms),
+                message="Eve agent aggregate input disagrees with its attributable LLM descendants",
+            )
+        if aggregate.output_tokens.value != descendant_output:
+            raise _conflict(
+                aggregate.span,
+                kind="ambiguous_token_ownership",
+                field="output_tokens",
+                source_keys=aggregate_source_keys,
+                related_span_ids=(item.span.span_id for item in directly_attributed_llms),
+                message=(
+                    "Eve agent aggregate output disagrees with its attributable LLM descendants"
+                ),
+            )
 
     agent_by_identity = {
         identity: item
