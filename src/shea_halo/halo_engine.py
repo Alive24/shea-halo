@@ -5,11 +5,12 @@ import json
 import os
 import re
 import stat
+import sys
 from contextlib import contextmanager
 from importlib.metadata import version
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
 from pydantic import BaseModel, ConfigDict
 
@@ -22,6 +23,9 @@ from shea_halo.security import (
     sanitize_persisted_text,
 )
 from shea_halo.workspace import HaloWorkspace
+
+if TYPE_CHECKING:
+    from engine.traces.models.trace_index_config import TraceIndexConfig
 
 
 class HaloEngineError(RuntimeError):
@@ -67,6 +71,46 @@ _PERSISTED_OUTPUTS = (
     "halo-telemetry.jsonl",
     ".halo-telemetry.jsonl.tmp",
 )
+
+
+def _trace_index_process_pool_available() -> bool:
+    """Mirror Python's semaphore preflight without mutating its process-global cache."""
+
+    try:
+        __import__("multiprocessing.synchronize")
+    except ImportError:
+        return False
+    try:
+        semaphore_limit = os.sysconf("SC_SEM_NSEMS_MAX")
+    except (AttributeError, ValueError):
+        return True
+    except PermissionError:
+        return False
+
+    return semaphore_limit == -1 or semaphore_limit >= 256
+
+
+async def _prebuild_trace_indexes_when_process_pool_unavailable(
+    trace_paths: list[Path],
+    trace_index_config: TraceIndexConfig,
+) -> bool:
+    """Build compatible sidecars through an isolated serial builder subclass."""
+
+    if _trace_index_process_pool_available():
+        return False
+    from engine.traces.trace_index_builder import TraceIndexBuilder
+
+    serial_builder = type(
+        "_SerialTraceIndexBuilder",
+        (TraceIndexBuilder,),
+        {"SMALL_FILE_THRESHOLD": sys.maxsize},
+    )
+    for trace_path in trace_paths:
+        await serial_builder.ensure_index_exists(
+            trace_path=trace_path,
+            config=trace_index_config,
+        )
+    return True
 
 
 def _trace_files(
@@ -455,6 +499,11 @@ class HaloEngineAdapter:
                 path_labels=path_labels,
             )
             model = ModelConfig(name=config.halo_model)
+            trace_index_config = TraceIndexConfig(index_dir=index_dir)
+            await _prebuild_trace_indexes_when_process_pool_unavailable(
+                trace_paths,
+                trace_index_config,
+            )
             engine_config = EngineConfig(
                 root_agent=AgentConfig(
                     name="Shea Halo trace investigator",
@@ -468,7 +517,7 @@ class HaloEngineAdapter:
                 ),
                 synthesis_model=model,
                 compaction_model=model,
-                trace_index=TraceIndexConfig(index_dir=index_dir),
+                trace_index=trace_index_config,
                 dataset_context=(
                     "Canonical OpenInference-shaped OpenTelemetry spans captured from the "
                     f"{config.repository} agent harness. The linked issue defines the study goal."

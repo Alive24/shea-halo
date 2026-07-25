@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -16,9 +17,11 @@ from shea_halo.halo_engine import (
     _halo_engine_environment,
     _managed_run_dir,
     _persist_safe_jsonl,
+    _prebuild_trace_indexes_when_process_pool_unavailable,
     _selected_trace_files,
     _trace_file,
     _trace_files,
+    _trace_index_process_pool_available,
     _write_safe_text,
 )
 from shea_halo.runtime_fs import RuntimeFilesystem
@@ -52,6 +55,141 @@ def test_canonical_flat_jsonl_manifest(tmp_path: Path) -> None:
 
     assert trace.span_count == 1
     assert len(trace.sha256) == 64
+
+
+def test_trace_index_process_pool_is_unavailable_when_semaphore_query_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def denied(_name: str) -> int:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "sysconf", denied)
+
+    assert not _trace_index_process_pool_available()
+
+
+def test_trace_index_keeps_parallel_path_when_semaphores_are_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "sysconf", lambda _name: 256)
+
+    assert _trace_index_process_pool_available()
+
+
+@pytest.mark.parametrize(("limit", "available"), [(-1, True), (255, False), (256, True)])
+def test_trace_index_process_pool_respects_reported_semaphore_limit(
+    limit: int,
+    available: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "sysconf", lambda _name: limit)
+
+    assert _trace_index_process_pool_available() is available
+
+
+def test_trace_index_process_pool_propagates_unexpected_sysconf_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failed(_name: str) -> int:
+        raise OSError(5, "I/O error")
+
+    monkeypatch.setattr(os, "sysconf", failed)
+
+    with pytest.raises(OSError, match="I/O error"):
+        _trace_index_process_pool_available()
+
+
+@pytest.mark.parametrize("error", [AttributeError("missing"), ValueError("unsupported")])
+def test_trace_index_process_pool_accepts_unavailable_sysconf_query(
+    error: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(_name: str) -> int:
+        raise error
+
+    monkeypatch.setattr(os, "sysconf", unavailable)
+
+    assert _trace_index_process_pool_available()
+
+
+@pytest.mark.asyncio
+async def test_trace_index_serial_fallback_does_not_mutate_halo_engine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engine.traces.models.trace_index_config import TraceIndexConfig
+    from engine.traces.trace_index_builder import TraceIndexBuilder
+
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(json.dumps(canonical_span()) + "\n", encoding="utf-8")
+    seen_thresholds: list[int] = []
+
+    async def capture_threshold(
+        cls: type[TraceIndexBuilder],
+        trace_path: Path,
+        config: TraceIndexConfig,
+    ) -> Path:
+        del trace_path, config
+        seen_thresholds.append(cls.SMALL_FILE_THRESHOLD)
+        return tmp_path / "index.jsonl"
+
+    monkeypatch.setattr(
+        "shea_halo.halo_engine._trace_index_process_pool_available",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        TraceIndexBuilder,
+        "ensure_index_exists",
+        classmethod(capture_threshold),
+    )
+    original_threshold = TraceIndexBuilder.SMALL_FILE_THRESHOLD
+
+    used_fallback = await _prebuild_trace_indexes_when_process_pool_unavailable(
+        [trace],
+        TraceIndexConfig(index_dir=tmp_path / "indexes"),
+    )
+
+    assert used_fallback
+    assert seen_thresholds == [sys.maxsize]
+    assert TraceIndexBuilder.SMALL_FILE_THRESHOLD == original_threshold
+
+
+@pytest.mark.asyncio
+async def test_serial_fallback_sidecar_is_reused_by_halo_engine_builder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engine.traces.models.trace_index_config import TraceIndexConfig
+    from engine.traces.trace_index_builder import TraceIndexBuilder
+
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        "".join(
+            json.dumps(canonical_span(span_id=f"{index:016x}")) + "\n" for index in range(1_001)
+        ),
+        encoding="utf-8",
+    )
+    config = TraceIndexConfig(index_dir=tmp_path / "indexes")
+    monkeypatch.setattr(
+        "shea_halo.halo_engine._trace_index_process_pool_available",
+        lambda: False,
+    )
+
+    assert await _prebuild_trace_indexes_when_process_pool_unavailable([trace], config)
+
+    async def forbidden_rebuild(
+        cls: type[TraceIndexBuilder],
+        trace_path: Path,
+    ) -> list[object]:
+        del cls, trace_path
+        raise AssertionError("base HALO builder attempted to rebuild the serial sidecar")
+
+    monkeypatch.setattr(TraceIndexBuilder, "_run_build", classmethod(forbidden_rebuild))
+
+    index_path = await TraceIndexBuilder.ensure_index_exists(trace, config)
+
+    assert index_path.is_file()
+    assert len(index_path.read_text(encoding="utf-8").splitlines()) == 1
 
 
 @pytest.mark.parametrize(
