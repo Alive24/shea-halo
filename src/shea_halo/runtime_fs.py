@@ -212,6 +212,52 @@ class RuntimeFilesystem:
             handle.close()
         return absolute
 
+    def finalize_file(self, source: Path, destination: Path) -> Path:
+        """Atomically publish a completed spool within one managed directory."""
+
+        absolute_source = self.path(source)
+        absolute_destination = self.path(destination)
+        if absolute_source.parent != absolute_destination.parent:
+            raise RuntimeFilesystemError(
+                "managed runtime finalization must stay within one directory"
+            )
+        with self._parent_fd(absolute_source, create=False) as (parent, source_name):
+            destination_name = absolute_destination.name
+            self._reject_unsafe_leaf(parent, source_name)
+            try:
+                source_metadata = os.stat(
+                    source_name,
+                    dir_fd=parent,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                raise RuntimeFilesystemError(
+                    "managed runtime spool could not be inspected"
+                ) from None
+            if not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_nlink != 1:
+                raise RuntimeFilesystemError("managed runtime spool is not a regular file")
+            try:
+                os.stat(destination_name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise RuntimeFilesystemError(
+                    "managed runtime final destination could not be inspected"
+                ) from None
+            else:
+                raise RuntimeFilesystemError("managed runtime final destination already exists")
+            try:
+                os.replace(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=parent,
+                    dst_dir_fd=parent,
+                )
+                os.fsync(parent)
+            except OSError:
+                raise RuntimeFilesystemError("managed runtime spool finalization failed") from None
+        return absolute_destination
+
     def remove_file(self, candidate: Path, *, missing_ok: bool = True) -> None:
         absolute = self.path(candidate)
         try:

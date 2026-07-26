@@ -234,10 +234,15 @@ def inventory_observations(
     """Build a deterministic, path-free inventory from the two controlled roots."""
 
     roots = _controlled_roots(config.root, workspace.path)
+    excluded_trace_roots = (
+        config.artifacts_dir / "research-traces",
+        workspace.path / config.artifacts_dir.relative_to(config.root) / "research-traces",
+    )
     trace_candidates = _discover(
         roots,
         config.observation.trace_globs,
         category="trace",
+        excluded_roots=excluded_trace_roots,
     )
     report_candidates = _discover(
         roots,
@@ -268,7 +273,14 @@ def discard_worktree_observation_changes(
     root = workspace.path.resolve(strict=True)
     roots = (_ObservationRoot(scope="worktree", path=root),)
     candidates = {
-        **_discover(roots, config.observation.trace_globs, category="trace"),
+        **_discover(
+            roots,
+            config.observation.trace_globs,
+            category="trace",
+            excluded_roots=(
+                root / config.artifacts_dir.relative_to(config.root) / "research-traces",
+            ),
+        ),
         **_discover(
             roots,
             config.observation.desktop_report_globs,
@@ -364,6 +376,7 @@ def _discover(
     patterns: tuple[str, ...],
     *,
     category: str,
+    excluded_roots: tuple[Path, ...] = (),
 ) -> dict[str, Path]:
     discovered: dict[str, Path] = {}
     for root in roots:
@@ -379,6 +392,8 @@ def _discover(
                     raise ObservationError(
                         f"{category} candidate escapes the controlled {root.scope} root"
                     )
+                if any(resolved.is_relative_to(excluded.resolve()) for excluded in excluded_roots):
+                    continue
                 if not resolved.is_file():
                     continue
                 relative = candidate.relative_to(root.path).as_posix()

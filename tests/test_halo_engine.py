@@ -275,7 +275,7 @@ def test_halo_engine_environment_sets_and_restores_runtime_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("CATALYST_OTLP_ENDPOINT", "https://previous.invalid")
+    monkeypatch.setenv("CATALYST_OTLP_ENDPOINT", "http://127.0.0.1:4318")
     monkeypatch.setenv("CATALYST_SERVICE_NAME", "previous-service")
     monkeypatch.delenv("HALO_TELEMETRY_PATH", raising=False)
     config = cast(
@@ -288,11 +288,11 @@ def test_halo_engine_environment_sets_and_restores_runtime_values(
     )
 
     with _halo_engine_environment(config, tmp_path):
-        assert os.environ["CATALYST_OTLP_ENDPOINT"] == "https://previous.invalid"
+        assert os.environ["CATALYST_OTLP_ENDPOINT"] == "http://127.0.0.1:4318"
         assert os.environ["CATALYST_SERVICE_NAME"] == "shea-halo"
         assert os.environ["HALO_TELEMETRY_PATH"] == str(tmp_path / "halo-telemetry.jsonl")
 
-    assert os.environ["CATALYST_OTLP_ENDPOINT"] == "https://previous.invalid"
+    assert os.environ["CATALYST_OTLP_ENDPOINT"] == "http://127.0.0.1:4318"
     assert os.environ["CATALYST_SERVICE_NAME"] == "previous-service"
     assert "HALO_TELEMETRY_PATH" not in os.environ
 

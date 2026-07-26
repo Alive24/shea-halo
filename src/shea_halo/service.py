@@ -16,7 +16,7 @@ from shea_halo.agent import (
     run_verification,
     validate_candidate_synthesis,
 )
-from shea_halo.config import HaloConfig, validate_catalyst_sdk_base_endpoint
+from shea_halo.config import HaloConfig, effective_catalyst_sdk_base_endpoint
 from shea_halo.github import GitHubClient, IssueComment, ProjectIssue, ProjectMetadata
 from shea_halo.halo_engine import HaloEngineAdapter
 from shea_halo.integrations import preflight_halo_desktop
@@ -42,6 +42,7 @@ from shea_halo.observation import (
 from shea_halo.provider import ApiMode, ProviderApiModeError
 from shea_halo.runtime_fs import append_runtime_text
 from shea_halo.security import sanitize_persisted_data, sanitize_persisted_text
+from shea_halo.tracing import ResearchTracing
 from shea_halo.workpad import (
     WorkpadHead,
     find_head,
@@ -167,11 +168,13 @@ class HaloService:
         *,
         investigator: Investigator | None = None,
         halo_engine: HaloEngineAdapter | None = None,
+        tracing: ResearchTracing | None = None,
     ) -> None:
         if not configs:
             raise ServiceError("at least one Shea Halo target is required")
         self.configs = configs
-        self.investigator = investigator or Investigator()
+        self.tracing = tracing or ResearchTracing.disabled()
+        self.investigator = investigator or Investigator(self.tracing.tracer)
         self.halo_engine = halo_engine or HaloEngineAdapter()
         self._terminal_items_seen: set[tuple[Path, str, str, str]] = set()
 
@@ -191,7 +194,16 @@ class HaloService:
                                     for key in self._terminal_items_seen
                                     if key[:2] != (config.root, issue.item_id)
                                 }
-                                await self._process(config, github, metadata, issue)
+                                try:
+                                    await self._process(config, github, metadata, issue)
+                                    if self.tracing.active:
+                                        self.tracing.finalize_run("research_recorded")
+                                except asyncio.CancelledError as exc:
+                                    self.tracing.abort_run(exc)
+                                    raise
+                                except Exception as exc:
+                                    self.tracing.abort_run(exc)
+                                    raise
                             else:
                                 terminal_key = (
                                     config.root,
@@ -266,6 +278,12 @@ class HaloService:
                 "Claimed this `Halo Research` item and recorded its stable experiment branch.",
             )
 
+        self.tracing.begin_run(
+            config,
+            halo_run_id=run_id,
+            issue_number=issue.number,
+        )
+
         github.assert_branch_has_no_pull_requests(issue.repository, workspace_branch)
         manager = WorkspaceManager(config)
         if (
@@ -310,24 +328,26 @@ class HaloService:
             pending_result = head.entry.state.result
             if pending_result is None:
                 raise ServiceError("pending publication has no persisted investigation result")
-            workspace = manager.prepare(
-                issue_number=issue.number,
-                title=issue.title,
-                persisted_branch=workspace_branch,
-                persisted_base_revision=head.entry.state.base_revision,
-                expected_snapshot=head.entry.state.branch,
-                publication_intent=pending,
-                allow_existing=True,
-            )
+            with self.tracing.stage("workspace-preparation"):
+                workspace = manager.prepare(
+                    issue_number=issue.number,
+                    title=issue.title,
+                    persisted_branch=workspace_branch,
+                    persisted_base_revision=head.entry.state.base_revision,
+                    expected_snapshot=head.entry.state.branch,
+                    publication_intent=pending,
+                    allow_existing=True,
+                )
             github.assert_branch_has_no_pull_requests(issue.repository, workspace_branch)
             github.assert_issue_remains_in_research(issue)
-            snapshot = manager.publish_intent(
-                workspace,
-                pending,
-                issue_number=issue.number,
-                title=issue.title,
-                expected_snapshot=head.entry.state.branch,
-            )
+            with self.tracing.stage("candidate-publication"):
+                snapshot = manager.publish_intent(
+                    workspace,
+                    pending,
+                    issue_number=issue.number,
+                    title=issue.title,
+                    expected_snapshot=head.entry.state.branch,
+                )
             workspace = manager.prepare_validation_workspace(
                 workspace,
                 issue_number=issue.number,
@@ -456,15 +476,16 @@ class HaloService:
             )
             return
 
-        workspace = manager.prepare(
-            issue_number=issue.number,
-            title=issue.title,
-            persisted_branch=workspace_branch,
-            persisted_base_revision=head.entry.state.base_revision,
-            expected_snapshot=head.entry.state.branch,
-            publication_intent=None,
-            allow_existing=is_reentry,
-        )
+        with self.tracing.stage("workspace-preparation"):
+            workspace = manager.prepare(
+                issue_number=issue.number,
+                title=issue.title,
+                persisted_branch=workspace_branch,
+                persisted_base_revision=head.entry.state.base_revision,
+                expected_snapshot=head.entry.state.branch,
+                publication_intent=None,
+                allow_existing=is_reentry,
+            )
         current_base_revision = manager.current_base_revision()
         if current_base_revision != workspace.base_revision:
             result = self._base_revision_drift_result(
@@ -508,65 +529,40 @@ class HaloService:
             and previous_result.outcome == Outcome.CONTINUE_RESEARCH
             and head.entry.state.input_fingerprint == input_fingerprint
         ):
+            self.tracing.discard_unchanged_scan()
             return
         desktop_preflight = None
         if config.observation.desktop_preflight == "external":
             # External mode owns only this public-surface check. It never
             # discovers or manages the operator's Desktop process.
-            effective_endpoint = validate_catalyst_sdk_base_endpoint(
-                os.getenv("CATALYST_OTLP_ENDPOINT") or config.observation.catalyst_sdk_base_endpoint
+            effective_endpoint = effective_catalyst_sdk_base_endpoint(
+                config.observation.catalyst_sdk_base_endpoint
             )
-            desktop_check = await preflight_halo_desktop(
-                effective_endpoint,
-                authorization_token=os.getenv("CATALYST_OTLP_TOKEN"),
-            )
+            with self.tracing.stage(
+                "observation-preflight",
+                attributes={"shea.observer.preflight.enabled": True},
+            ):
+                desktop_check = await preflight_halo_desktop(
+                    effective_endpoint,
+                    authorization_token=None,
+                )
             desktop_preflight = desktop_check.receipt
             if not desktop_check.passed:
-                if desktop_check.blocker is None:
-                    raise ServiceError("failed Desktop preflight has no blocker")
-                result = InvestigationResult(
-                    outcome=Outcome.BLOCKED,
-                    summary="The external HALO Desktop public-surface preflight failed.",
-                    residual_risks=[
-                        (
-                            "The external Desktop preflight classified the public "
-                            f"surface as {desktop_check.receipt.classification.value!r}."
-                        )
-                    ],
-                    blocker=desktop_check.blocker,
-                    blocker_verified=True,
-                    desktop_preflight=desktop_check.receipt,
-                )
-                self._finish(
-                    config=config,
-                    github=github,
-                    metadata=metadata,
-                    issue=issue,
-                    producer=producer,
-                    head=head,
-                    state=HaloState(
-                        issue_repository=issue.repository,
-                        issue_number=issue.number,
-                        run_id=run_id,
-                        phase="blocked",
-                        api_mode=config.api_mode,
-                        workspace_branch=workspace_branch,
-                        base_revision=workspace.base_revision,
-                        branch=head.entry.state.branch,
-                        input_fingerprint=input_fingerprint,
-                        result=result,
-                    ),
-                )
                 self._log(
                     config,
                     issue,
-                    "desktop_preflight_blocked",
+                    "desktop_observer_unavailable",
                     {
                         "classification": desktop_check.receipt.classification,
                         "run_id": run_id,
                     },
                 )
-                return
+        else:
+            with self.tracing.stage(
+                "observation-preflight",
+                attributes={"shea.observer.preflight.enabled": False},
+            ):
+                pass
         experimenting = HaloState(
             issue_repository=issue.repository,
             issue_number=issue.number,
@@ -591,13 +587,14 @@ class HaloService:
         )
 
         try:
-            halo_analysis = await self.halo_engine.analyze(
-                config=config,
-                workspace=workspace,
-                run_id=run_id,
-                issue_title=issue.title,
-                issue_body=issue.body,
-            )
+            with self.tracing.stage("halo-engine-analysis"):
+                halo_analysis = await self.halo_engine.analyze(
+                    config=config,
+                    workspace=workspace,
+                    run_id=run_id,
+                    issue_title=issue.title,
+                    issue_body=issue.body,
+                )
             result = await self.investigator.run(
                 config=config,
                 workspace=workspace,
@@ -738,13 +735,14 @@ class HaloService:
             )
             github.assert_branch_has_no_pull_requests(issue.repository, workspace_branch)
             github.assert_issue_remains_in_research(issue)
-            snapshot = manager.publish_intent(
-                workspace,
-                intent,
-                issue_number=issue.number,
-                title=issue.title,
-                expected_snapshot=head.entry.state.branch,
-            )
+            with self.tracing.stage("candidate-publication"):
+                snapshot = manager.publish_intent(
+                    workspace,
+                    intent,
+                    issue_number=issue.number,
+                    title=issue.title,
+                    expected_snapshot=head.entry.state.branch,
+                )
 
         workspace = manager.prepare_validation_workspace(
             workspace,
@@ -905,27 +903,39 @@ class HaloService:
         if baseline is None:
             raise ServiceError("candidate validation has no persisted observation baseline")
         try:
-            setup_actions = run_configured_stage(
-                config,
-                workspace.path,
-                kind="setup",
-                stage="setup",
-                service_version=candidate_revision,
-            )
+            with self.tracing.stage("configured-runtime-setup"):
+                setup_actions = run_configured_stage(
+                    config,
+                    workspace.path,
+                    kind="setup",
+                    stage="setup",
+                    service_version=candidate_revision,
+                    halo_run_id=run_id,
+                    issue_number=issue.number,
+                    candidate_revision=candidate_revision,
+                )
             experiment_baseline = inventory_observations(config, workspace)
-            experiment_actions = run_configured_stage(
-                config,
-                workspace.path,
-                kind="experiment",
-                stage="candidate_validation",
-                service_version=candidate_revision,
-            )
+            with self.tracing.stage("configured-runtime-experiments"):
+                experiment_actions = run_configured_stage(
+                    config,
+                    workspace.path,
+                    kind="experiment",
+                    stage="candidate_validation",
+                    service_version=candidate_revision,
+                    halo_run_id=run_id,
+                    issue_number=issue.number,
+                    candidate_revision=candidate_revision,
+                )
             experiment_checkpoint = inventory_observations(config, workspace)
-            verification, verification_actions = run_verification(
-                config,
-                workspace.path,
-                service_version=candidate_revision,
-            )
+            with self.tracing.stage("exact-revision-verification"):
+                verification, verification_actions = run_verification(
+                    config,
+                    workspace.path,
+                    service_version=candidate_revision,
+                    halo_run_id=run_id,
+                    issue_number=issue.number,
+                    candidate_revision=candidate_revision,
+                )
             checkpoint = inventory_observations(config, workspace)
         except Exception as exc:
             manager.discard_unpublished_attempt(
@@ -1074,14 +1084,15 @@ class HaloService:
         post_analysis = None
         if candidate_traces:
             try:
-                post_analysis = await self.halo_engine.analyze(
-                    config=config,
-                    workspace=workspace,
-                    run_id=f"{run_id}-candidate",
-                    issue_title=issue.title,
-                    issue_body=issue.body,
-                    trace_sha256s=frozenset(trace.sha256 for trace in candidate_traces),
-                )
+                with self.tracing.stage("halo-engine-analysis"):
+                    post_analysis = await self.halo_engine.analyze(
+                        config=config,
+                        workspace=workspace,
+                        run_id=f"{run_id}-candidate",
+                        issue_title=issue.title,
+                        issue_body=issue.body,
+                        trace_sha256s=frozenset(trace.sha256 for trace in candidate_traces),
+                    )
             except ProviderApiModeError as exc:
                 manager.prepare_validation_workspace(
                     workspace,
@@ -1480,7 +1491,18 @@ class HaloService:
                 "status_transition": pending_transition,
             }
         )
-        head = self._append(github, issue, head, producer, routed, summary)
+        self.tracing.attach_result(state.result)
+        with self.tracing.stage(
+            "project-routing",
+            attributes={
+                "shea.project.routing.terminal": target_status is not None,
+                "shea.project.routing.target": target_status or "Halo Research",
+            },
+        ):
+            head = self._append(github, issue, head, producer, routed, summary)
+        # Canonical evidence is authoritative and must be durable before a
+        # terminal Project mutation can promote this research result.
+        self.tracing.finalize_run(state.result.outcome.value)
         if target_status is None:
             return head
 
@@ -1863,8 +1885,8 @@ class HaloService:
         runtime_environment = {
             name: os.environ.get(name) is not None for name in config.target_environment_variables
         }
-        effective_catalyst_endpoint = validate_catalyst_sdk_base_endpoint(
-            os.getenv("CATALYST_OTLP_ENDPOINT") or config.observation.catalyst_sdk_base_endpoint
+        effective_catalyst_endpoint = effective_catalyst_sdk_base_endpoint(
+            config.observation.catalyst_sdk_base_endpoint
         )
         payload = {
             "daily_refresh": datetime.now(UTC).date().isoformat(),
@@ -1996,10 +2018,15 @@ def targets_from_environment() -> list[HaloConfig]:
 
 
 async def run_worker() -> None:
-    service = HaloService(targets_from_environment())
+    configs = targets_from_environment()
     poll_seconds = int(os.getenv("SHEA_HALO_POLL_SECONDS", "60"))
     if poll_seconds < 10:
         raise ServiceError("SHEA_HALO_POLL_SECONDS must be at least 10")
-    while True:
-        await service.run_once()
-        await asyncio.sleep(poll_seconds)
+    tracing = ResearchTracing.initialize(configs)
+    service = HaloService(configs, tracing=tracing)
+    try:
+        while True:
+            await service.run_once()
+            await asyncio.sleep(poll_seconds)
+    finally:
+        tracing.shutdown()

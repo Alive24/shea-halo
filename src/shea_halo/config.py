@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, cast
@@ -111,6 +112,8 @@ def validate_catalyst_sdk_base_endpoint(value: str) -> str:
         parsed.port
     except ValueError as exc:
         raise ConfigError(f"observation.{name} must be an HTTP(S) base URL") from exc
+    if parsed.hostname not in {"127.0.0.1", "::1"}:
+        raise ConfigError(f"observation.{name} must use a literal loopback host in local-only mode")
 
     normalized_path = parsed.path.rstrip("/")
     if normalized_path.endswith("/v1/traces"):
@@ -121,6 +124,31 @@ def validate_catalyst_sdk_base_endpoint(value: str) -> str:
             f"observation.{name} may end with /v1/traces but cannot contain content after it"
         )
     return value
+
+
+def validate_trace_locality_environment(
+    environment: Mapping[str, str] | None = None,
+) -> None:
+    """Reject trace credentials before Catalyst can initialize or emit a payload."""
+
+    source = os.environ if environment is None else environment
+    forbidden = ("CATALYST_OTLP_TOKEN", "OTLP_INGEST_TOKEN")
+    configured = [name for name in forbidden if name in source]
+    if configured:
+        raise ConfigError(
+            "trace ingest tokens are forbidden in local-only mode: " + ", ".join(configured)
+        )
+
+
+def effective_catalyst_sdk_base_endpoint(
+    configured: str,
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the environment override through the same fail-closed locality gate."""
+
+    source = os.environ if environment is None else environment
+    validate_trace_locality_environment(source)
+    return validate_catalyst_sdk_base_endpoint(source.get("CATALYST_OTLP_ENDPOINT") or configured)
 
 
 def _catalyst_sdk_base_endpoint(data: dict[str, Any]) -> str:
@@ -257,6 +285,10 @@ class HaloConfig:
         runtime = _table(data, "runtime")
         models = _table(data, "models")
         target_environment_variables = _environment_names(experiments, "experiments")
+        if "CATALYST_OTLP_TOKEN" in target_environment_variables:
+            raise ConfigError(
+                "experiments.pass_env cannot include CATALYST_OTLP_TOKEN in local-only mode"
+            )
         if target_environment_variables and not uses_local_config:
             raise ConfigError("experiments.pass_env is allowed only in ignored halo.local.toml")
 

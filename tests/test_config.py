@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 from conftest import write_target_config
 
-from shea_halo.config import ConfigError, HaloConfig
+from shea_halo.config import (
+    ConfigError,
+    HaloConfig,
+    effective_catalyst_sdk_base_endpoint,
+)
 
 
 def test_loads_minimal_target_config(tmp_path: Path) -> None:
@@ -33,12 +37,11 @@ def test_loads_minimal_target_config(tmp_path: Path) -> None:
     ("endpoint", "expected"),
     [
         ("http://127.0.0.1:8799", "http://127.0.0.1:8799"),
-        ("https://telemetry.example.com/collector", "https://telemetry.example.com/collector"),
-        ("https://telemetry.example.com/collector/", "https://telemetry.example.com/collector/"),
+        ("https://[::1]:8799/collector", "https://[::1]:8799/collector"),
         ("http://127.0.0.1:8799/v1/traces", "http://127.0.0.1:8799"),
         (
-            "https://telemetry.example.com/collector/v1/traces/",
-            "https://telemetry.example.com/collector",
+            "https://[::1]:8799/collector/v1/traces/",
+            "https://[::1]:8799/collector",
         ),
     ],
 )
@@ -73,6 +76,10 @@ def test_accepts_and_normalizes_catalyst_sdk_endpoint(
         "http://example.com/collector/v1/traces/more",
         " http://127.0.0.1:8799",
         "http://127.0.0.1:99999",
+        "http://localhost:8799",
+        "http://192.168.1.2:8799",
+        "http://10.0.0.2:8799",
+        "https://telemetry.example.com/collector",
     ],
 )
 def test_rejects_invalid_catalyst_sdk_base_endpoint(
@@ -106,6 +113,31 @@ def test_rejects_legacy_desktop_otlp_endpoint_field(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="not supported"):
         HaloConfig.load(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://localhost:8799",
+        "http://172.16.0.2:8799",
+        "https://telemetry.inference.net",
+        "http://user@127.0.0.1:8799",
+    ],
+)
+def test_environment_endpoint_override_is_locality_checked(endpoint: str) -> None:
+    with pytest.raises(ConfigError, match="catalyst_sdk_base_endpoint"):
+        effective_catalyst_sdk_base_endpoint(
+            "http://127.0.0.1:8799",
+            {"CATALYST_OTLP_ENDPOINT": endpoint},
+        )
+
+
+def test_trace_token_environment_is_rejected_even_for_loopback() -> None:
+    with pytest.raises(ConfigError, match="tokens are forbidden"):
+        effective_catalyst_sdk_base_endpoint(
+            "http://127.0.0.1:8799",
+            {"CATALYST_OTLP_TOKEN": "secret"},
+        )
 
 
 def test_external_desktop_preflight_must_be_enabled_explicitly(tmp_path: Path) -> None:
@@ -286,7 +318,7 @@ def test_complete_local_config_takes_precedence(tmp_path: Path) -> None:
         .replace("Alive24/FailureReport", "Alive24/LocalTarget")
         .replace(
             "[experiments]",
-            '[experiments]\npass_env = ["OPENAI_API_KEY", "CATALYST_OTLP_TOKEN"]',
+            '[experiments]\npass_env = ["OPENAI_API_KEY"]',
         )
         .replace(
             "[observation]",
@@ -303,10 +335,23 @@ def test_complete_local_config_takes_precedence(tmp_path: Path) -> None:
     assert config.repository == "Alive24/LocalTarget"
     assert config.api_mode == "chat_completions"
     assert config.observation.desktop_preflight == "external"
-    assert config.target_environment_variables == (
-        "CATALYST_OTLP_TOKEN",
-        "OPENAI_API_KEY",
+    assert config.target_environment_variables == ("OPENAI_API_KEY",)
+
+
+def test_local_config_cannot_pass_trace_credentials(tmp_path: Path) -> None:
+    write_target_config(tmp_path)
+    shared = tmp_path / ".shea/halo.toml"
+    local = tmp_path / ".shea/halo.local.toml"
+    local.write_text(
+        shared.read_text(encoding="utf-8").replace(
+            "[experiments]",
+            '[experiments]\npass_env = ["CATALYST_OTLP_TOKEN"]',
+        ),
+        encoding="utf-8",
     )
+
+    with pytest.raises(ConfigError, match="CATALYST_OTLP_TOKEN"):
+        HaloConfig.load(tmp_path)
 
 
 def test_shared_config_cannot_request_host_credentials(tmp_path: Path) -> None:

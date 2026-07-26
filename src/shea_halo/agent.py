@@ -15,15 +15,11 @@ from agents import (
     Runner,
     function_tool,
 )
-from inference_catalyst_tracing import (
-    CatalystTracing,
-    SpanKindValues,
-    agent_span,
-    manual_span,
-    setup,
-)
+from inference_catalyst_tracing import SpanKindValues, agent_span, manual_span
+from opentelemetry import trace
+from opentelemetry.trace import Tracer
 
-from shea_halo.config import HaloConfig, validate_catalyst_sdk_base_endpoint
+from shea_halo.config import HaloConfig, effective_catalyst_sdk_base_endpoint
 from shea_halo.halo_engine import HaloAnalysisArtifact
 from shea_halo.integrations import (
     FetchedGuide,
@@ -195,23 +191,36 @@ def target_environment(
     *,
     service_version: str | None = None,
     include_runtime_credentials: bool = False,
+    halo_run_id: str | None = None,
+    issue_number: int | None = None,
+    candidate_revision: str | None = None,
 ) -> dict[str, str]:
     environment = sanitized_environment()
+    for name in (
+        "SHEA_HALO_RUN_ID",
+        "SHEA_HALO_TARGET_REPOSITORY",
+        "SHEA_HALO_ISSUE_NUMBER",
+        "SHEA_HALO_CANDIDATE_REVISION",
+        "CATALYST_SERVICE_VERSION",
+    ):
+        environment.pop(name, None)
     if include_runtime_credentials:
         for name in config.target_environment_variables:
             value = os.environ.get(name)
             if value is not None:
                 environment[name] = value
-    endpoint = validate_catalyst_sdk_base_endpoint(
-        environment.get(
-            "CATALYST_OTLP_ENDPOINT",
-            config.observation.catalyst_sdk_base_endpoint,
-        )
-    )
+    endpoint = effective_catalyst_sdk_base_endpoint(config.observation.catalyst_sdk_base_endpoint)
     environment["CATALYST_OTLP_ENDPOINT"] = endpoint
     environment["CATALYST_SERVICE_NAME"] = config.repository.rsplit("/", 1)[-1].casefold()
+    environment["SHEA_HALO_TARGET_REPOSITORY"] = config.repository
     if service_version is not None:
         environment["CATALYST_SERVICE_VERSION"] = service_version
+    if halo_run_id is not None:
+        environment["SHEA_HALO_RUN_ID"] = halo_run_id
+    if issue_number is not None:
+        environment["SHEA_HALO_ISSUE_NUMBER"] = str(issue_number)
+    if candidate_revision is not None:
+        environment["SHEA_HALO_CANDIDATE_REVISION"] = candidate_revision
     return environment
 
 
@@ -239,6 +248,9 @@ def _repository_search_argv(query: str, glob: str | None = None) -> list[str]:
 
 
 class Investigator:
+    def __init__(self, tracer: Tracer | None = None) -> None:
+        self.tracer = tracer or trace.get_tracer("shea-halo.agent")
+
     async def synthesize_candidate(
         self,
         *,
@@ -280,82 +292,73 @@ class Investigator:
             tools=[],
             output_type=AgentDecision,
         )
-        tracing = setup(
-            endpoint=validate_catalyst_sdk_base_endpoint(
-                os.getenv("CATALYST_OTLP_ENDPOINT") or config.observation.catalyst_sdk_base_endpoint
-            ),
-            service_name=os.getenv("CATALYST_SERVICE_NAME") or "shea-halo",
-        )
         model_bootstrap = OpenAIModelBootstrap(config.api_mode)
-        try:
-            with agent_span(
-                tracing.tracer,
-                agent_id="shea-halo-candidate-synthesis",
-                agent_name="Shea Halo Candidate Synthesis",
-                span_name="shea-halo.candidate-synthesis",
-                session_id=f"{config.repository}#{issue_number}",
-                agent_role="final-evidence-synthesis",
-                system="openai",
-            ) as span:
-                span.set_input(candidate_revision)
-                span.set_attribute("shea.target.repository", config.repository)
-                span.set_attribute("shea.issue.number", issue_number)
-                span.set_attribute("shea.candidate.revision", candidate_revision)
-                decision: AgentDecision | None = None
-                for attempt in range(2):
-                    try:
-                        result = await Runner.run(
-                            agent,
-                            prompt,
-                            max_turns=3,
-                            run_config=model_bootstrap.run_config(),
-                        )
-                    except Exception as exc:
-                        model_bootstrap.reraise_if_unsupported(exc)
+        with agent_span(
+            self.tracer,
+            agent_id="shea-halo-candidate-synthesis",
+            agent_name="Shea Halo Candidate Synthesis",
+            span_name="shea-halo.candidate-synthesis",
+            session_id=f"{config.repository}#{issue_number}",
+            agent_role="final-evidence-synthesis",
+            system="openai",
+        ) as span:
+            span.set_input(candidate_revision)
+            span.set_attribute("shea.target.repository", config.repository)
+            span.set_attribute("shea.issue.number", issue_number)
+            span.set_attribute("shea.candidate.revision", candidate_revision)
+            decision: AgentDecision | None = None
+            for attempt in range(2):
+                try:
+                    result = await Runner.run(
+                        agent,
+                        prompt,
+                        max_turns=3,
+                        run_config=model_bootstrap.run_config(),
+                    )
+                except Exception as exc:
+                    model_bootstrap.reraise_if_unsupported(exc)
+                    raise
+                candidate = result.final_output
+                if not isinstance(candidate, AgentDecision):
+                    raise InvestigationError(
+                        "candidate synthesizer returned an invalid structured result"
+                    )
+                try:
+                    validate_candidate_synthesis(
+                        candidate,
+                        candidate_revision=candidate_revision,
+                        halo_analysis=halo_analysis,
+                        candidate_traces=candidate_traces,
+                        validation_actions=validation_actions,
+                    )
+                except CandidateExperimentBindingError as exc:
+                    if attempt != 0:
                         raise
-                    candidate = result.final_output
-                    if not isinstance(candidate, AgentDecision):
-                        raise InvestigationError(
-                            "candidate synthesizer returned an invalid structured result"
-                        )
-                    try:
-                        validate_candidate_synthesis(
-                            candidate,
-                            candidate_revision=candidate_revision,
-                            halo_analysis=halo_analysis,
-                            candidate_traces=candidate_traces,
-                            validation_actions=validation_actions,
-                        )
-                    except CandidateExperimentBindingError as exc:
-                        if attempt != 0:
-                            raise
-                        prompt = candidate_experiment_correction_prompt(
-                            prompt,
-                            candidate,
-                            exc,
-                        )
-                        span.set_attribute("shea.candidate.synthesis.correction_count", 1)
-                        span.set_attribute(
-                            "shea.candidate.synthesis.invalid_experiment_indices",
-                            ",".join(str(index) for index in exc.invalid_indices),
-                        )
-                        span.set_attribute(
-                            "shea.candidate.synthesis.eligible_experiment_indices",
-                            ",".join(str(index) for index in exc.eligible_indices) or "<none>",
-                        )
-                        span.set_attribute(
-                            "shea.candidate.synthesis.draft_sha256",
-                            hashlib.sha256(candidate.model_dump_json().encode("utf-8")).hexdigest(),
-                        )
-                        continue
-                    decision = candidate
-                    span.set_attribute("shea.candidate.synthesis.attempts", attempt + 1)
-                    break
-                if decision is None:
-                    raise InvestigationError("candidate synthesis did not return a decision")
-                span.set_output(decision.outcome.value)
-        finally:
-            tracing.shutdown()
+                    prompt = candidate_experiment_correction_prompt(
+                        prompt,
+                        candidate,
+                        exc,
+                    )
+                    span.set_attribute("shea.candidate.synthesis.correction_count", 1)
+                    span.set_attribute(
+                        "shea.candidate.synthesis.invalid_experiment_indices",
+                        ",".join(str(index) for index in exc.invalid_indices),
+                    )
+                    span.set_attribute(
+                        "shea.candidate.synthesis.eligible_experiment_indices",
+                        ",".join(str(index) for index in exc.eligible_indices) or "<none>",
+                    )
+                    span.set_attribute(
+                        "shea.candidate.synthesis.draft_sha256",
+                        hashlib.sha256(candidate.model_dump_json().encode("utf-8")).hexdigest(),
+                    )
+                    continue
+                decision = candidate
+                span.set_attribute("shea.candidate.synthesis.attempts", attempt + 1)
+                break
+            if decision is None:
+                raise InvestigationError("candidate synthesis did not return a decision")
+            span.set_output(decision.outcome.value)
         return decision
 
     async def run(
@@ -379,13 +382,10 @@ class Investigator:
         refs_by_url.update({guide.url: guide for guide in candidates})
         fetched: dict[str, FetchedGuide] = {}
         executed_actions: list[ExecutedAction] = []
-        tracing: CatalystTracing | None = None
 
         def tool_span(name: str):
-            if tracing is None:
-                raise InvestigationError("Halo tracing was not initialized")
             return manual_span(
-                tracing.tracer,
+                self.tracer,
                 name=f"tool.{name}",
                 span_kind=SpanKindValues.TOOL,
                 tool_name=name,
@@ -578,6 +578,8 @@ class Investigator:
                         config,
                         service_version=run_id,
                         include_runtime_credentials=kind == "experiment",
+                        halo_run_id=run_id,
+                        issue_number=issue_number,
                     ),
                 )
                 executed_actions.append(
@@ -640,44 +642,35 @@ class Investigator:
                 include_in_history=False,
             )
 
-        tracing = setup(
-            endpoint=validate_catalyst_sdk_base_endpoint(
-                os.getenv("CATALYST_OTLP_ENDPOINT") or config.observation.catalyst_sdk_base_endpoint
-            ),
-            service_name=os.getenv("CATALYST_SERVICE_NAME") or "shea-halo",
-        )
         model_bootstrap = OpenAIModelBootstrap(config.api_mode)
-        try:
-            with agent_span(
-                tracing.tracer,
-                agent_id="shea-halo",
-                agent_name="Shea Halo",
-                span_name="shea-halo.investigation",
-                session_id=f"{config.repository}#{run_id}",
-                agent_role="harness-research",
-                system="openai",
-            ) as span:
-                span.set_input(f"{config.repository}#{issue_number}")
-                span.set_attribute("shea.target.repository", config.repository)
-                span.set_attribute("shea.issue.number", issue_number)
-                span.set_attribute("shea.halo.run_id", run_id)
-                try:
-                    result = await Runner.run(
-                        agent,
-                        prompt,
-                        max_turns=config.investigator_max_turns,
-                        run_config=model_bootstrap.run_config(),
-                        error_handlers={"max_turns": checkpoint_at_turn_limit},
-                    )
-                except Exception as exc:
-                    model_bootstrap.reraise_if_unsupported(exc)
-                    raise
-                decision = result.final_output
-                if not isinstance(decision, AgentDecision):
-                    raise InvestigationError("investigator returned an invalid structured result")
-                span.set_output(decision.outcome.value)
-        finally:
-            tracing.shutdown()
+        with agent_span(
+            self.tracer,
+            agent_id="shea-halo",
+            agent_name="Shea Halo",
+            span_name="shea-halo.investigation",
+            session_id=f"{config.repository}#{run_id}",
+            agent_role="harness-research",
+            system="openai",
+        ) as span:
+            span.set_input(f"{config.repository}#{issue_number}")
+            span.set_attribute("shea.target.repository", config.repository)
+            span.set_attribute("shea.issue.number", issue_number)
+            span.set_attribute("shea.halo.run_id", run_id)
+            try:
+                result = await Runner.run(
+                    agent,
+                    prompt,
+                    max_turns=config.investigator_max_turns,
+                    run_config=model_bootstrap.run_config(),
+                    error_handlers={"max_turns": checkpoint_at_turn_limit},
+                )
+            except Exception as exc:
+                model_bootstrap.reraise_if_unsupported(exc)
+                raise
+            decision = result.final_output
+            if not isinstance(decision, AgentDecision):
+                raise InvestigationError("investigator returned an invalid structured result")
+            span.set_output(decision.outcome.value)
 
         snapshots = selected_snapshots(decision, fetched, refs_by_url)
         changed_paths = _changed_paths(workspace.path)
@@ -778,6 +771,9 @@ def run_configured_stage(
     kind: ActionKind,
     stage: Literal["setup", "candidate_validation", "verification"],
     service_version: str,
+    halo_run_id: str | None = None,
+    issue_number: int | None = None,
+    candidate_revision: str | None = None,
 ) -> list[ExecutedAction]:
     results: list[ExecutedAction] = []
     for index, (configured_kind, command) in enumerate(configured_actions(config)):
@@ -790,6 +786,9 @@ def run_configured_stage(
                 config,
                 service_version=service_version,
                 include_runtime_credentials=kind == "experiment",
+                halo_run_id=halo_run_id,
+                issue_number=issue_number,
+                candidate_revision=candidate_revision,
             ),
         )
         results.append(
@@ -812,6 +811,9 @@ def run_verification(
     workspace: Path,
     *,
     service_version: str,
+    halo_run_id: str | None = None,
+    issue_number: int | None = None,
+    candidate_revision: str | None = None,
 ) -> tuple[list[Verification], list[ExecutedAction]]:
     results: list[Verification] = []
     actions = run_configured_stage(
@@ -820,6 +822,9 @@ def run_verification(
         kind="verification",
         stage="verification",
         service_version=service_version,
+        halo_run_id=halo_run_id,
+        issue_number=issue_number,
+        candidate_revision=candidate_revision,
     )
     for action in actions:
         results.append(
@@ -982,9 +987,11 @@ tests its hypothesis. Read the installed public HALO Engine span contract before
 implementing JSONL capture. A real tracing experiment must both export standard OTLP to the
 configured endpoint and write canonical one-span-per-line JSONL through public
 OpenTelemetry/exporter APIs. Atomically replace the JSONL output, await exporter
-flush/shutdown, and make the configured action fail if OTLP delivery is rejected. Do not add
-a proprietary receiver or schema and do not read HALO Desktop internals. The deterministic
-runtime will publish the candidate, rerun all configured runtime experiments with
+flush/shutdown, and fail if canonical JSONL persistence or finalization fails. A missing
+loopback viewer is supplemental observation status, not a failure of otherwise complete
+canonical evidence. Do not add a proprietary receiver or schema and do not read HALO
+Desktop internals. The deterministic runtime will publish the candidate, rerun all
+configured runtime experiments with
 CATALYST_SERVICE_VERSION set to the exact candidate revision, and then rerun verification.
 Treat this run as bounded exploration: batch related reads and edits, and return as soon as
 the smallest useful candidate has a successful focused experiment. Do not spend exploratory
@@ -1259,8 +1266,9 @@ from model judgment alone.
 
 For tracing experiments, use only public framework/OpenTelemetry APIs. Export standard OTLP,
 atomically replace a canonical one-span-per-line JSONL artifact, await exporter
-flush/shutdown, and return a nonzero action status when delivery fails. HALO Desktop may
-observe the OTLP stream, but its private storage and APIs are never an evidence source.
+flush/shutdown, and return a nonzero action status when canonical JSONL persistence or
+finalization fails. HALO Desktop may observe the loopback OTLP stream, but its absence is
+supplemental status and its private storage and APIs are never an evidence source.
 
 You may edit and test experimental code. Git branch creation, commits, pushes, Project
 status, comments, PRs, and all remote lifecycle actions belong to the deterministic Halo

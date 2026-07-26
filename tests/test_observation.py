@@ -122,6 +122,34 @@ def test_inventory_is_stable_path_free_and_covers_both_roots(tmp_path: Path) -> 
     assert str(active.path) not in serialized
 
 
+def test_research_trace_bundles_never_enter_target_candidate_discovery(
+    tmp_path: Path,
+) -> None:
+    config, active = configured_roots(tmp_path)
+    config = replace(
+        config,
+        observation=replace(
+            config.observation,
+            trace_globs=(".shea/artifacts/halo/**/*.jsonl",),
+        ),
+    )
+    candidate = config.root / ".shea/artifacts/halo/traces/candidate.jsonl"
+    control_plane = (
+        config.artifacts_dir / "research-traces" / "halo-26-test" / "control-plane.jsonl"
+    )
+    incomplete = control_plane.with_name("control-plane.jsonl.incomplete")
+    span = canonical_span(trace_id="a" * 32, span_id="1" * 16)
+    write_trace(candidate, span)
+    write_trace(control_plane, span)
+    write_trace(incomplete, span)
+
+    checkpoint = inventory_observations(config, active)
+
+    assert [item.label for item in checkpoint.traces] == [
+        "target/.shea/artifacts/halo/traces/candidate.jsonl"
+    ]
+
+
 def test_inventory_counts_every_span_bound_to_a_service_version(tmp_path: Path) -> None:
     config, active = configured_roots(tmp_path)
     trace = active.path / ".shea/artifacts/halo/traces/versioned.jsonl"
