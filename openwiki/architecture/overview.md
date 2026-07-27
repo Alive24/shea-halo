@@ -7,7 +7,14 @@ tags: [shea-halo, architecture, github, research-runtime]
 
 # Shea Halo architecture and source map
 
-Shea Halo is a long-running Python worker whose control plane is a GitHub Issue plus its GitHub Project status. `python -m shea_halo` accepts no action arguments; `HaloService` polls configured targets, processes items in `Halo Research`, and reconciles interrupted terminal transitions for items that have already moved to another status (`src/shea_halo/__main__.py`, `src/shea_halo/service.py`). The worker is configured per target repository, not by the committed Shea Symphony workflow for this repository.
+Shea Halo is a GitHub-native research agent implemented as a long-running
+Python worker whose control plane is a GitHub Issue plus its GitHub Project
+status. `python -m shea_halo` accepts no action arguments; `HaloService` polls
+configured targets, processes items in `Halo Research`, and reconciles
+interrupted terminal transitions for items that have already moved to another
+status (`src/shea_halo/__main__.py`, `src/shea_halo/service.py`). The worker is
+configured per target repository, not by the committed Shea Symphony workflow
+for this repository.
 
 ## Product boundary
 

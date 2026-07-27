@@ -8,7 +8,14 @@ tags: [shea-halo, quickstart, github, research-agent]
 
 # Shea Halo quickstart
 
-Shea Halo is an alpha-stage Python worker that investigates how to improve agent loops and harnesses. Its product surface is a GitHub Issue in a configured GitHub Project: moving an item into `Halo Research` starts or resumes research, while a sufficiently proven implementation handoff moves the same item to `Todo`. It is **not** an action CLI; `python -m shea_halo` rejects arguments and continuously polls configured targets (`README.md`, `src/shea_halo/__main__.py`, `src/shea_halo/service.py`).
+Shea Halo is an alpha-stage GitHub-native research agent for improving agent
+loops and their harnesses. It runs as a long-running local Python worker whose
+product surface is a GitHub Issue in a configured GitHub Project: moving an
+item into `Halo Research` starts or resumes research, while a sufficiently
+proven implementation handoff moves the same item to `Todo`. It is **not** an
+action CLI; `python -m shea_halo` rejects arguments and continuously polls
+configured targets (`README.md`, `src/shea_halo/__main__.py`,
+`src/shea_halo/service.py`).
 
 The maintained product overview is `README.md`. This wiki is an engineer-oriented map of the current source, tests, and committed workflow contracts; it does not replace that README or turn proposed research into shipped behavior.
 
