@@ -49,6 +49,7 @@ from shea_halo.service import (
     _provider_api_mode_blocker,
     _runtime_source_sha256,
 )
+from shea_halo.tracing import ResearchTracing
 from shea_halo.workpad import WorkpadHead, find_head, next_entry, render_entry
 from shea_halo.workspace import HaloWorkspace, WorkspaceManager
 
@@ -1294,6 +1295,78 @@ def test_finish_persists_pending_then_applied_status_transition(tmp_path: Path) 
     assert pending.entry.state.status_transition is not None
     assert pending.entry.state.status_transition.state == "pending"
     assert pending.entry.state.status_transition.created_at == transition.created_at
+
+
+def test_completed_result_finalizes_trace_before_workpad_publication(
+    tmp_path: Path,
+) -> None:
+    write_target_config(tmp_path)
+    config = HaloConfig.load(tmp_path)
+    issue = _issue(config)
+    initial_state = HaloState(
+        issue_repository=config.repository,
+        issue_number=issue.number,
+        run_id="halo-20-finalize-first",
+        phase="research",
+        workspace_branch="halo/issue-20-improve-eve-tracing",
+    )
+    initial_entry = next_entry(initial_state, None, producer="halo-bot")
+    order: list[str] = []
+
+    class Tracing:
+        def attach_result(self, _result: InvestigationResult) -> None:
+            order.append("attach_result")
+
+        def finalize_run(self, _outcome: str) -> Path:
+            order.append("finalize_run")
+            return tmp_path / "manifest.json"
+
+    class FailingGitHub(_FakeGitHub):
+        def add_comment(
+            self,
+            _repository: str,
+            _number: int,
+            body: str,
+        ) -> IssueComment:
+            del body
+            order.append("add_comment")
+            raise RuntimeError("GitHub comment unavailable")
+
+    github = FailingGitHub(
+        [
+            IssueComment(
+                database_id=100,
+                author="halo-bot",
+                body=render_entry(initial_entry, "Claimed."),
+                created_at="2026-07-24T00:00:00Z",
+            )
+        ]
+    )
+    state = initial_state.model_copy(
+        update={
+            "result": InvestigationResult(
+                outcome=Outcome.CONTINUE_RESEARCH,
+                summary="The run completed with a recoverable result.",
+            )
+        }
+    )
+    service = HaloService(
+        [config],
+        investigator=cast(Investigator, _FakeInvestigator()),
+        tracing=cast(ResearchTracing, Tracing()),
+    )
+
+    with pytest.raises(RuntimeError, match="comment unavailable"):
+        service._append_result(
+            cast(GitHubClient, github),
+            issue,
+            WorkpadHead(comment_id=100, entry=initial_entry),
+            "halo-bot",
+            state,
+            "Recorded the result.",
+        )
+
+    assert order == ["attach_result", "finalize_run", "add_comment"]
 
 
 def test_terminal_item_reconciles_applied_comment_after_status_write(tmp_path: Path) -> None:

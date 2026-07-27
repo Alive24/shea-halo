@@ -30,6 +30,7 @@ from shea_halo.models import (
     Outcome,
     Phase,
     StatusTransition,
+    WorkpadEntry,
 )
 from shea_halo.observation import (
     FileObservation,
@@ -47,7 +48,7 @@ from shea_halo.workpad import (
     WorkpadHead,
     find_head,
     next_entry,
-    render_entry,
+    prepare_entry,
     trusted_workpad_comment_ids,
 )
 from shea_halo.workspace import HaloWorkspace, WorkspaceManager, branch_name
@@ -675,7 +676,7 @@ class HaloService:
                 input_fingerprint=input_fingerprint,
                 result=result,
             )
-            self._append(
+            self._append_result(
                 github,
                 issue,
                 head,
@@ -1042,7 +1043,7 @@ class HaloService:
                 input_fingerprint=None,
                 result=failed,
             )
-            self._append(
+            self._append_result(
                 github,
                 issue,
                 head,
@@ -1278,7 +1279,7 @@ class HaloService:
                 ),
                 desktop_preflight=preliminary_result.desktop_preflight,
             )
-            self._append(
+            self._append_result(
                 github,
                 issue,
                 head,
@@ -1491,6 +1492,8 @@ class HaloService:
                 "status_transition": pending_transition,
             }
         )
+        github.assert_issue_remains_in_research(issue)
+        entry, body = self._prepare_append(head, producer, routed, summary)
         self.tracing.attach_result(state.result)
         with self.tracing.stage(
             "project-routing",
@@ -1499,10 +1502,18 @@ class HaloService:
                 "shea.project.routing.target": target_status or "Halo Research",
             },
         ):
-            head = self._append(github, issue, head, producer, routed, summary)
+            pass
         # Canonical evidence is authoritative and must be durable before a
-        # terminal Project mutation can promote this research result.
+        # Workpad publication or Project mutation can promote this result.
         self.tracing.finalize_run(state.result.outcome.value)
+        github.assert_issue_remains_in_research(issue)
+        head = self._persist_prepared(
+            github,
+            issue,
+            producer,
+            entry,
+            body,
+        )
         if target_status is None:
             return head
 
@@ -1531,7 +1542,34 @@ class HaloService:
         )
 
     @staticmethod
+    def _prepare_append(
+        head: WorkpadHead | None,
+        producer: str,
+        state: HaloState,
+        summary: str,
+    ) -> tuple[WorkpadEntry, str]:
+        return prepare_entry(next_entry(state, head, producer=producer), summary)
+
+    @staticmethod
+    def _persist_prepared(
+        github: GitHubClient,
+        issue: ProjectIssue,
+        producer: str,
+        entry: WorkpadEntry,
+        body: str,
+    ) -> WorkpadHead:
+        comment = github.add_comment(
+            issue.repository,
+            issue.number,
+            body,
+        )
+        if comment.author.casefold() != producer.casefold():
+            raise ServiceError("GitHub persisted the Halo workpad under an unexpected author")
+        return WorkpadHead(comment_id=comment.database_id, entry=entry)
+
+    @classmethod
     def _append(
+        cls,
         github: GitHubClient,
         issue: ProjectIssue,
         head: WorkpadHead | None,
@@ -1543,15 +1581,26 @@ class HaloService:
     ) -> WorkpadHead:
         if require_research:
             github.assert_issue_remains_in_research(issue)
-        entry = next_entry(state, head, producer=producer)
-        comment = github.add_comment(
-            issue.repository,
-            issue.number,
-            render_entry(entry, summary),
-        )
-        if comment.author.casefold() != producer.casefold():
-            raise ServiceError("GitHub persisted the Halo workpad under an unexpected author")
-        return WorkpadHead(comment_id=comment.database_id, entry=entry)
+        entry, body = cls._prepare_append(head, producer, state, summary)
+        return cls._persist_prepared(github, issue, producer, entry, body)
+
+    def _append_result(
+        self,
+        github: GitHubClient,
+        issue: ProjectIssue,
+        head: WorkpadHead,
+        producer: str,
+        state: HaloState,
+        summary: str,
+    ) -> WorkpadHead:
+        if state.result is None:
+            raise ServiceError("a completed research append requires an investigation result")
+        github.assert_issue_remains_in_research(issue)
+        entry, body = self._prepare_append(head, producer, state, summary)
+        self.tracing.attach_result(state.result)
+        self.tracing.finalize_run(state.result.outcome.value)
+        github.assert_issue_remains_in_research(issue)
+        return self._persist_prepared(github, issue, producer, entry, body)
 
     @staticmethod
     def _gate_outcome(

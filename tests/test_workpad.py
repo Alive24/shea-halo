@@ -9,6 +9,7 @@ from shea_halo.workpad import (
     WorkpadError,
     find_head,
     next_entry,
+    prepare_entry,
     render_entry,
     trusted_workpad_comment_ids,
 )
@@ -299,3 +300,44 @@ def test_workpad_rejects_an_oversized_comment() -> None:
 
     with pytest.raises(WorkpadError, match="comment size"):
         render_entry(entry, "x" * 61_000)
+
+
+def test_workpad_compacts_oversized_structured_state_with_a_digest_receipt() -> None:
+    result = InvestigationResult(
+        outcome=Outcome.CONTINUE_RESEARCH,
+        summary="The bounded research result remains recoverable.",
+        evidence=[
+            Evidence(claim=f"claim {index} " + "c" * 900, source="trace:" + "d" * 300)
+            for index in range(10)
+        ],
+        competing_hypotheses=["h" * 12_000 for _ in range(8)],
+        residual_risks=["r" * 8_000 for _ in range(12)],
+        todo_handoff="t" * 4_000,
+    )
+    oversized = next_entry(
+        state().model_copy(update={"result": result}),
+        None,
+        producer="halo-bot",
+    )
+
+    with pytest.raises(WorkpadError, match="comment size"):
+        render_entry(oversized, "Research recorded.")
+
+    compact, body = prepare_entry(oversized, "Research recorded.")
+
+    assert len(body.encode("utf-8")) <= 60_000
+    assert compact.details_compacted is True
+    assert compact.details_sha256 is not None
+    assert compact.state.result is not None
+    assert compact.state.result.outcome == result.outcome
+    assert compact.state.result.summary == result.summary
+    assert len(compact.state.result.evidence) <= 3
+    assert all(len(hypothesis) <= 500 for hypothesis in compact.state.result.competing_hypotheses)
+    head = find_head(
+        [comment(101, body)],
+        repository="Alive24/FailureReport",
+        issue_number=20,
+        trusted_producers={"halo-bot"},
+    )
+    assert head is not None
+    assert head.entry == compact
