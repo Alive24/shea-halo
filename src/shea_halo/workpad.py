@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 from collections.abc import Collection
@@ -10,9 +11,11 @@ from shea_halo.github import IssueComment
 from shea_halo.models import (
     ExecutedAction,
     ExternalBlocker,
+    GateStatus,
     GuideSnapshot,
     HaloState,
     InvestigationResult,
+    Outcome,
     Verification,
     WorkpadEntry,
 )
@@ -21,10 +24,20 @@ from shea_halo.observation import (
     TraceObservation,
     TraceValidation,
 )
-from shea_halo.security import sanitize_persisted_data, sanitize_persisted_text
+from shea_halo.security import (
+    sanitize_persisted_data,
+    sanitize_persisted_text,
+    sanitize_visible_text,
+)
 
 MARKER = "<!-- shea-halo-workpad -->"
 MAX_WORKPAD_BYTES = 60_000
+_VISIBLE_SUMMARY_CHARS = 1_200
+_VISIBLE_HANDOFF_CHARS = 1_600
+_VISIBLE_BLOCKER_CHARS = 800
+_VISIBLE_RISK_CHARS = 400
+_VISIBLE_GATE_REASON_CHARS = 600
+_VISIBLE_GATE_REASON_LIMIT = 8
 _JSON_BLOCK = re.compile(
     r"<details>\s*<summary>Structured state</summary>\s*```json\s*(\{.*?\})\s*```"
     r"\s*</details>",
@@ -209,6 +222,220 @@ def next_entry(state: HaloState, head: WorkpadHead | None, *, producer: str) -> 
 
 def _clip(value: str, limit: int) -> str:
     return value if len(value) <= limit else value[:limit]
+
+
+def _visible_text(value: str, limit: int) -> str:
+    """Render model-authored text as bounded inert prose, not Markdown structure."""
+
+    sanitized = sanitize_visible_text(value)
+    collapsed = " ".join(sanitized.split())
+    clipped = collapsed if len(collapsed) <= limit else f"{collapsed[: limit - 1]}…"
+    return html.escape(clipped, quote=False)
+
+
+def _count_status(items: Collection[bool]) -> str:
+    if not items:
+        return "not recorded"
+    return f"{sum(items)}/{len(items)} passed"
+
+
+def _identity_lines(entry: WorkpadEntry) -> list[str]:
+    state = entry.state
+    result = state.result
+    branch = state.branch
+    candidate_revision = None
+    if result is not None and result.trace_validation is not None:
+        candidate_revision = result.trace_validation.candidate_revision
+    if result is not None and candidate_revision is None:
+        candidate_revision = branch.head_revision if branch is not None else state.base_revision
+
+    lines = [
+        f"- Run: `{sanitize_persisted_text(state.run_id)}`",
+        f"- Workpad revision: `{entry.revision}`",
+        (
+            f"- Base revision: `{sanitize_persisted_text(state.base_revision)}`"
+            if state.base_revision is not None
+            else "- Base revision: not recorded"
+        ),
+    ]
+    if candidate_revision is not None:
+        lines.append(f"- Candidate revision: `{sanitize_persisted_text(candidate_revision)}`")
+    if branch is None:
+        lines.append("- Experimental snapshot: not published")
+    else:
+        lines.append(
+            "- Experimental snapshot: "
+            f"`{sanitize_persisted_text(branch.name)}` at "
+            f"`{sanitize_persisted_text(branch.head_revision)}` "
+            "(`experimental_snapshot_only`; do not open a PR from it or continue work on it)"
+        )
+    if entry.details_compacted and entry.details_sha256 is not None:
+        lines.append(
+            f"- Compacted-detail receipt: `sha256:{sanitize_persisted_text(entry.details_sha256)}`"
+        )
+    return lines
+
+
+def _gate_lines(result: InvestigationResult) -> list[str]:
+    disposition = result.gate_disposition
+    if disposition is None:
+        lines = ["- Deterministic gate: **NOT EVALUATED** — no gate receipt was recorded."]
+    elif disposition.status == GateStatus.PASSED:
+        lines = [
+            "- Deterministic gate: **PASS** for proposed outcome "
+            f"`{disposition.proposed_outcome.value}`."
+        ]
+    elif disposition.status == GateStatus.NOT_EVALUATED:
+        lines = ["- Deterministic gate: **NOT EVALUATED** — the result was already non-terminal."]
+    else:
+        lines = [
+            "- Deterministic gate: **FAIL** — proposed outcome "
+            f"`{disposition.proposed_outcome.value}` was rejected.",
+            f"- Missing requirements: `{len(disposition.reasons)}`",
+        ]
+        lines.extend(
+            f"  - {_visible_text(reason, _VISIBLE_GATE_REASON_CHARS)}"
+            for reason in disposition.reasons[:_VISIBLE_GATE_REASON_LIMIT]
+        )
+        omitted = len(disposition.reasons) - _VISIBLE_GATE_REASON_LIMIT
+        if omitted > 0:
+            lines.append(f"  - {omitted} additional gate reason(s) remain in structured state.")
+
+    setup = [action.exit_code == 0 for action in result.executed_actions if action.stage == "setup"]
+    runtime = [
+        action.exit_code == 0
+        for action in result.executed_actions
+        if action.kind == "experiment" and action.stage == "candidate_validation"
+    ]
+    verification = [check.status == "passed" for check in result.verification]
+    lines.extend(
+        (
+            f"- HALO analysis: {'present' if result.analysis_sha256 else 'missing'}",
+            f"- Setup actions: {_count_status(setup)}",
+            f"- Revision-bound runtime experiments: {_count_status(runtime)}",
+            f"- Deterministic verification: {_count_status(verification)}",
+        )
+    )
+    if not result.trace_validation_required:
+        lines.append("- Trace validation: not required")
+    elif result.trace_validation is None:
+        lines.append("- Trace validation: **missing**")
+    else:
+        validation = result.trace_validation
+        hierarchy_verified = bool(
+            validation.candidate_traces
+            and any(trace.parented_span_count > 0 for trace in validation.candidate_traces)
+        )
+        lines.append(
+            "- Trace validation: "
+            f"{'**PASS**' if validation.complete else '**FAIL**'} "
+            f"(dataset={'pass' if validation.halo_dataset_verified else 'fail'}, "
+            f"revision={'pass' if validation.halo_revision_verified else 'fail'}, "
+            f"`service.version`={'pass' if validation.service_version_verified else 'fail'}, "
+            f"hierarchy={'pass' if hierarchy_verified else 'fail'})"
+        )
+    return lines
+
+
+def _result_sections(result: InvestigationResult, *, phase: str) -> str:
+    outcome_text = {
+        Outcome.READY_FOR_TODO: "Implementation handoff is dispatchable.",
+        Outcome.CONTINUE_RESEARCH: "Research remains non-terminal.",
+        Outcome.NO_CHANGE: "Research is complete with no implementation change.",
+        Outcome.BLOCKED: "Research is blocked by a verified external dependency.",
+    }[result.outcome]
+    gate_failed = (
+        result.gate_disposition is not None and result.gate_disposition.status == GateStatus.FAILED
+    )
+    summary_label = (
+        "Model-authored context only; its rejected terminal wording is not authoritative"
+        if gate_failed
+        else "Result summary"
+    )
+
+    if result.todo_handoff is None or not result.todo_handoff.strip():
+        handoff = "No implementation handoff was retained."
+    elif result.outcome == Outcome.READY_FOR_TODO:
+        handoff = (
+            "**Dispatchable:** this handoff may be implemented by Shea Symphony.\n\n"
+            f"{_visible_text(result.todo_handoff, _VISIBLE_HANDOFF_CHARS)}"
+        )
+    else:
+        handoff = (
+            "**Provisional — not dispatchable:** the authoritative outcome is not "
+            "`ready_for_todo`.\n\n"
+            f"{_visible_text(result.todo_handoff, _VISIBLE_HANDOFF_CHARS)}"
+        )
+
+    blocker = "No verified external blocker."
+    if result.outcome == Outcome.BLOCKED and result.blocker_verified and result.blocker is not None:
+        blocker = (
+            f"- Category: `{result.blocker.category}`\n"
+            "- Verified blocker: "
+            f"{_visible_text(result.blocker.description, _VISIBLE_BLOCKER_CHARS)}\n"
+            "- Required operator action: "
+            f"{_visible_text(result.blocker.required_action, _VISIBLE_BLOCKER_CHARS)}"
+        )
+
+    if result.residual_risks:
+        risks = "\n".join(
+            f"- {_visible_text(risk, _VISIBLE_RISK_CHARS)}" for risk in result.residual_risks[:4]
+        )
+        if len(result.residual_risks) > 4:
+            risks += (
+                f"\n- {len(result.residual_risks) - 4} additional model-authored risk(s) "
+                "remain in structured state."
+            )
+    else:
+        risks = "No model-authored residual risks were recorded."
+
+    next_action = {
+        Outcome.READY_FOR_TODO: (
+            "Move the same Project item to `Todo`. Shea Symphony may implement the "
+            "dispatchable handoff in a separate workspace and branch."
+        ),
+        Outcome.CONTINUE_RESEARCH: (
+            "Keep the item in `Halo Research`; satisfy the failed or missing evidence "
+            "requirements before attempting another terminal decision."
+        ),
+        Outcome.NO_CHANGE: (
+            "Move the item to `Done`; no implementation should be dispatched from this result."
+        ),
+        Outcome.BLOCKED: (
+            "Move the item to `Need Human Input`. Complete the required operator action, "
+            "then return it to `Halo Research`."
+        ),
+    }[result.outcome]
+
+    return f"""\
+### Authoritative decision
+
+- Outcome: `{result.outcome.value}`
+- Lifecycle phase: `{phase}`
+- Disposition: {outcome_text}
+
+**{summary_label}:** {_visible_text(result.summary, _VISIBLE_SUMMARY_CHARS)}
+
+### Evidence gates
+
+{chr(10).join(_gate_lines(result))}
+
+### Implementation handoff
+
+{handoff}
+
+### External blocker
+
+{blocker}
+
+### Model-authored residual risks
+
+{risks}
+
+### Next lifecycle action
+
+{next_action}
+"""
 
 
 def _compact_trace(trace: TraceObservation) -> TraceObservation:
@@ -421,25 +648,24 @@ def render_entry(entry: WorkpadEntry, summary: str) -> str:
         indent=2,
         sort_keys=True,
     )
-    branch = entry.state.branch
-    branch_text = (
-        "No experimental branch has been published."
-        if branch is None
+    result_sections = (
+        _result_sections(entry.state.result, phase=entry.state.phase)
+        if entry.state.result is not None
         else (
-            f"`{sanitize_persisted_text(branch.name)}` at "
-            f"`{sanitize_persisted_text(branch.head_revision)}` is an experimental snapshot only. "
-            "Do not open a PR from it or continue development on it."
+            "### Lifecycle checkpoint\n\n"
+            f"{_visible_text(summary, _VISIBLE_SUMMARY_CHARS)}\n\n"
+            "### Next lifecycle action\n\n"
+            "Continue the current Halo lifecycle phase; no material result has been recorded.\n"
         )
     )
     rendered = f"""\
 {MARKER}
 ## Shea Halo — {entry.state.phase}
 
-{sanitize_persisted_text(summary)}
+{result_sections}
+### Lifecycle identity
 
-- Run: `{sanitize_persisted_text(entry.state.run_id)}`
-- Workpad revision: `{entry.revision}`
-- Branch: {branch_text}
+{chr(10).join(_identity_lines(entry))}
 
 <details>
 <summary>Structured state</summary>

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal, TypeAlias
+from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -19,6 +19,31 @@ class Outcome(StrEnum):
     NO_CHANGE = "no_change"
     CONTINUE_RESEARCH = "continue_research"
     BLOCKED = "blocked"
+
+
+class GateStatus(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+    NOT_EVALUATED = "not_evaluated"
+
+
+class GateDisposition(StrictModel):
+    """Deterministic result-gate receipt, separate from model-authored risks."""
+
+    status: GateStatus
+    proposed_outcome: Outcome
+    reasons: list[Annotated[str, Field(min_length=1, max_length=1_000)]] = Field(
+        default_factory=list,
+        max_length=12,
+    )
+
+    @model_validator(mode="after")
+    def _status_matches_reasons(self) -> GateDisposition:
+        if self.status == GateStatus.FAILED and not self.reasons:
+            raise ValueError("a failed gate disposition requires at least one reason")
+        if self.status != GateStatus.FAILED and self.reasons:
+            raise ValueError("only a failed gate disposition may contain reasons")
+        return self
 
 
 Phase: TypeAlias = Literal[
@@ -152,6 +177,7 @@ class AgentDecision(StrictModel):
 
 class InvestigationResult(StrictModel):
     outcome: Outcome
+    gate_disposition: GateDisposition | None = None
     turn_budget_exhausted: bool = False
     summary: str = Field(max_length=2_000)
     evidence: list[Evidence] = Field(default_factory=list, max_length=10)
@@ -169,6 +195,22 @@ class InvestigationResult(StrictModel):
     blocker: ExternalBlocker | None = None
     blocker_verified: bool = False
     desktop_preflight: HaloDesktopPreflightReceipt | None = None
+
+    @model_validator(mode="after")
+    def _outcome_matches_gate_disposition(self) -> InvestigationResult:
+        gate = self.gate_disposition
+        if gate is None:
+            return self
+        if gate.status == GateStatus.PASSED and self.outcome != gate.proposed_outcome:
+            raise ValueError("a passed gate must preserve its proposed outcome")
+        if gate.status == GateStatus.FAILED and self.outcome != Outcome.CONTINUE_RESEARCH:
+            raise ValueError("a failed gate must produce continue_research")
+        if gate.status == GateStatus.NOT_EVALUATED and (
+            self.outcome != Outcome.CONTINUE_RESEARCH
+            or gate.proposed_outcome != Outcome.CONTINUE_RESEARCH
+        ):
+            raise ValueError("a non-evaluated gate is valid only for continue_research")
+        return self
 
 
 class BranchSnapshot(StrictModel):

@@ -153,6 +153,11 @@ _UNC_HOST_PATH = re.compile(
     r"\\[^\\\s\"'<>`|,;)\]}]+"
     r"(?:\\[^\\\s\"'<>`|,;)\]}]+)*"
 )
+_RUNTIME_ENDPOINT = re.compile(
+    r"(?i)\b(?:grpc|grpcs|http|https|otlp)://[^\s\"'<>`|)\]}]+"
+    r"|(?<![A-Za-z0-9_.-])(?:127(?:\.[0-9]{1,3}){3}|localhost|\[?::1\]?):[0-9]{2,5}"
+    r"(?:/[^\s\"'<>`|)\]}]*)?"
+)
 
 
 def _is_sensitive_name(name: str) -> bool:
@@ -365,6 +370,22 @@ def sanitize_persisted_text(
     if contains_host_absolute_path(sanitized):
         raise PersistenceSafetyError("persisted text still contains a host absolute path")
     return sanitized
+
+
+def sanitize_visible_text(
+    text: str,
+    *,
+    path_labels: Mapping[Path, str] | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    """Sanitize a public summary and remove runtime endpoint values."""
+
+    sanitized = sanitize_persisted_text(
+        text,
+        path_labels=path_labels,
+        environment=environment,
+    )
+    return _RUNTIME_ENDPOINT.sub("[ENDPOINT]", sanitized)
 
 
 def redact_data(value: Any, environment: Mapping[str, str] | None = None) -> Any:

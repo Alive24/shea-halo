@@ -25,6 +25,8 @@ from shea_halo.models import (
     BranchSnapshot,
     ExecutedAction,
     ExternalBlocker,
+    GateDisposition,
+    GateStatus,
     HaloState,
     InvestigationResult,
     Outcome,
@@ -124,6 +126,33 @@ def _validated_result_with_residual_risks(
         }
     )
     return InvestigationResult.model_validate(updated.model_dump())
+
+
+def _gate_rejection(
+    result: InvestigationResult,
+    reasons: Iterable[str],
+    *,
+    proposed_outcome: Outcome | None = None,
+) -> InvestigationResult:
+    """Record harness-owned rejection evidence without recasting it as model risk."""
+
+    prior = result.gate_disposition
+    prior_reasons = prior.reasons if prior is not None and prior.status == GateStatus.FAILED else []
+    disposition = GateDisposition(
+        status=GateStatus.FAILED,
+        proposed_outcome=(
+            prior.proposed_outcome
+            if prior is not None and prior.status == GateStatus.FAILED
+            else proposed_outcome or result.outcome
+        ),
+        reasons=list(dict.fromkeys((*prior_reasons, *reasons))),
+    )
+    return result.model_copy(
+        update={
+            "outcome": Outcome.CONTINUE_RESEARCH,
+            "gate_disposition": disposition,
+        }
+    )
 
 
 def _provider_api_mode_blocker(
@@ -1344,13 +1373,13 @@ class HaloService:
         )
         retained_result_risks: tuple[str, ...] = ()
         if preliminary_result.turn_budget_exhausted:
+            proposed_outcome = result.outcome
             retained_result_risks = (
                 *_checkpoint_invariant_risks(preliminary_result),
                 *result.residual_risks,
             )
             result = result.model_copy(
                 update={
-                    "outcome": Outcome.CONTINUE_RESEARCH,
                     "turn_budget_exhausted": True,
                     "summary": preliminary_result.summary,
                     "todo_handoff": None,
@@ -1366,23 +1395,33 @@ class HaloService:
                     ),
                 }
             )
+            result = _gate_rejection(
+                result,
+                [_TURN_BUDGET_CHECKPOINT_RISK],
+                proposed_outcome=proposed_outcome,
+            )
         if not source_clean:
             source_mutation_risk = (
                 "A candidate-validation command changed repository source "
                 "after publication; Halo discarded that unrecorded change."
             )
+            proposed_outcome = result.outcome
             retained_result_risks = (
                 *retained_result_risks,
                 source_mutation_risk,
             )
             result = result.model_copy(
                 update={
-                    "outcome": Outcome.CONTINUE_RESEARCH,
                     "residual_risks": [
                         *result.residual_risks,
                         source_mutation_risk,
                     ],
                 }
+            )
+            result = _gate_rejection(
+                result,
+                [source_mutation_risk],
+                proposed_outcome=proposed_outcome,
             )
         current_base_revision = manager.current_base_revision()
         if current_base_revision != workspace.base_revision:
@@ -1415,12 +1454,16 @@ class HaloService:
             )
             result = result.model_copy(
                 update={
-                    "outcome": Outcome.CONTINUE_RESEARCH,
                     "residual_risks": [
                         *result.residual_risks,
                         unpublished_snapshot_risk,
                     ],
                 }
+            )
+            result = _gate_rejection(
+                result,
+                [unpublished_snapshot_risk],
+                proposed_outcome=Outcome.READY_FOR_TODO,
             )
 
         result = _validated_result_with_residual_risks(
@@ -1610,6 +1653,19 @@ class HaloService:
     ) -> InvestigationResult:
         """Demote unsupported terminal claims to continued research."""
 
+        if result.outcome == Outcome.CONTINUE_RESEARCH:
+            if result.gate_disposition is not None:
+                return result
+            return result.model_copy(
+                update={
+                    "gate_disposition": GateDisposition(
+                        status=GateStatus.NOT_EVALUATED,
+                        proposed_outcome=Outcome.CONTINUE_RESEARCH,
+                    )
+                }
+            )
+
+        proposed_outcome = result.outcome
         missing: list[str] = []
         if candidate_revision is None and result.trace_validation is not None:
             candidate_revision = result.trace_validation.candidate_revision
@@ -1727,16 +1783,18 @@ class HaloService:
                     "A no-change conclusion requires all deterministic verification to pass."
                 )
 
-        if not missing:
-            return result
-        residual_risks = list(result.residual_risks)
-        for reason in missing:
-            if reason not in residual_risks:
-                residual_risks.append(reason)
+        if missing:
+            return _gate_rejection(
+                result,
+                missing,
+                proposed_outcome=proposed_outcome,
+            )
         return result.model_copy(
             update={
-                "outcome": Outcome.CONTINUE_RESEARCH,
-                "residual_risks": residual_risks,
+                "gate_disposition": GateDisposition(
+                    status=GateStatus.PASSED,
+                    proposed_outcome=proposed_outcome,
+                )
             }
         )
 

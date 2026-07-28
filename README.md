@@ -27,7 +27,20 @@ Halo Research
 
 `Need Human Input` is reserved for a structured external blocker such as a missing credential, network failure, permission boundary, missing input, or unavailable service. Incomplete evidence stays in `Halo Research`.
 
-Every workpad entry links to its predecessor, shows a human-readable summary first, and puts canonical JSON in a folded block. Shea Halo never edits an Issue body or existing comment. Marker-like comments from untrusted authors are ordinary discussion, while an edited trusted workpad comment fails closed.
+Every workpad entry links to its predecessor, shows a bounded human-readable result first, and puts canonical JSON in a folded block. Shea Halo never edits an Issue body or existing comment. Marker-like comments from untrusted authors are ordinary discussion, while an edited trusted workpad comment fails closed.
+
+For a material result, the visible part of the comment is the operator decision surface. It identifies the authoritative post-gate outcome and lifecycle phase, base and candidate revisions, experimental snapshot, deterministic evidence-gate disposition, implementation handoff, verified external blocker, model-authored residual risks, and next lifecycle action. Deterministic gate failures are stored separately from residual risks, so a model summary that says research is complete cannot override a final `continue_research` outcome. Runtime endpoints, credentials, host paths, raw traces, prompts, model/tool payloads, and command output are excluded from this projection.
+
+Interpret the four rendered result states as follows:
+
+| Authoritative outcome | Operator interpretation |
+|---|---|
+| `ready_for_todo` | The evidence gate passed. The visible handoff is dispatchable to Shea Symphony in a separate implementation workspace and branch. |
+| `continue_research` | The result is non-terminal. Any retained handoff is explicitly provisional and non-dispatchable; satisfy the listed deterministic gate reasons before another terminal decision. |
+| `blocked` | A verified external blocker names its category and required operator action. Resolve it, then return the item to `Halo Research`. |
+| `no_change` | The evidence gate passed and research concluded without an implementation change. Move the item to `Done`; there is no dispatchable handoff. |
+
+Normal and aggressive workpad compaction retain this visible decision boundary and a digest receipt for omitted structured detail. Structured JSON remains the recoverable machine authority.
 
 On re-entry, Halo reads the prior trusted workpad result plus ordinary Issue discussion. It fingerprints the Issue, discussion, observation artifacts, branch snapshot, effective experiment contract, and the Shea Halo runtime source loaded at worker startup, so an unchanged incomplete item is not rerun every polling interval. The environment part records only allowlisted environment-variable names and whether each is present, plus the normalized effective OTLP endpoint—never credential values. New comments, new trace/Desktop artifacts, target code or configuration changes, a Shea Halo runtime update, runtime capability becoming available, and a daily documentation refresh reopen the loop.
 
