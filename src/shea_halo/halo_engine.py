@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from shea_halo.config import HaloConfig, validate_catalyst_sdk_base_endpoint
+from shea_halo.config import HaloConfig, effective_catalyst_sdk_base_endpoint
 from shea_halo.provider import ApiMode, OpenAIModelBootstrap
 from shea_halo.runtime_fs import RuntimeFilesystem, RuntimeFilesystemError
 from shea_halo.security import (
@@ -206,7 +206,14 @@ def _trace_files(
     roots = {config.root.resolve(strict=True)}
     if additional_root is not None:
         roots.add(additional_root.resolve(strict=True))
+    artifacts_dir = getattr(
+        config,
+        "artifacts_dir",
+        config.root / ".shea" / "artifacts" / "halo",
+    )
+    artifacts_relative = artifacts_dir.relative_to(config.root)
     for root in roots:
+        research_trace_root = (root / artifacts_relative / "research-traces").resolve()
         for pattern in config.observation.trace_globs:
             for candidate in root.glob(pattern):
                 display = candidate.relative_to(root)
@@ -218,6 +225,8 @@ def _trace_files(
                     raise HaloEngineError(
                         f"trace glob resolved outside the target repository: {display}"
                     )
+                if resolved.is_relative_to(research_trace_root):
+                    continue
                 if resolved.is_file():
                     files.add(resolved)
     return sorted(files)
@@ -503,8 +512,8 @@ def _halo_engine_environment(
     telemetry_path: Path | None = None,
 ) -> Iterator[None]:
     overrides = {
-        "CATALYST_OTLP_ENDPOINT": validate_catalyst_sdk_base_endpoint(
-            os.getenv("CATALYST_OTLP_ENDPOINT") or config.observation.catalyst_sdk_base_endpoint
+        "CATALYST_OTLP_ENDPOINT": effective_catalyst_sdk_base_endpoint(
+            config.observation.catalyst_sdk_base_endpoint
         ),
         "CATALYST_SERVICE_NAME": "shea-halo",
         "HALO_TELEMETRY_PATH": str(telemetry_path or run_dir / "halo-telemetry.jsonl"),

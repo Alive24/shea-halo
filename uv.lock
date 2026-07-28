@@ -1277,7 +1277,11 @@ dependencies = [
     { name = "halo-engine" },
     { name = "inference-catalyst-tracing", extra = ["openai-agents"] },
     { name = "openai-agents" },
+    { name = "opentelemetry-exporter-otlp-proto-common" },
+    { name = "opentelemetry-sdk" },
+    { name = "protobuf" },
     { name = "pydantic" },
+    { name = "requests" },
 ]
 
 [package.dev-dependencies]
@@ -1293,7 +1297,11 @@ requires-dist = [
     { name = "halo-engine", specifier = "==0.2.1" },
     { name = "inference-catalyst-tracing", extras = ["openai-agents"], specifier = "==0.1.8" },
     { name = "openai-agents", specifier = "==0.14.7" },
+    { name = "opentelemetry-exporter-otlp-proto-common", specifier = "==1.44.0" },
+    { name = "opentelemetry-sdk", specifier = "==1.44.0" },
+    { name = "protobuf", specifier = "==7.35.1" },
     { name = "pydantic", specifier = "==2.13.3" },
+    { name = "requests", specifier = "==2.34.2" },
 ]
 
 [package.metadata.requires-dev]

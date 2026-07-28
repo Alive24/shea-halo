@@ -117,10 +117,6 @@ async def test_investigator_uses_configured_turn_budget(
     monkeypatch.setattr("shea_halo.agent.rank_guides", lambda _guides, _dependencies: [])
     monkeypatch.setattr("shea_halo.agent.load_desktop_reports", lambda _config: "")
     monkeypatch.setattr("shea_halo.agent._changed_paths", lambda _path: [])
-    monkeypatch.setattr(
-        "shea_halo.agent.setup",
-        lambda **_kwargs: SimpleNamespace(tracer=object(), shutdown=lambda: None),
-    )
     monkeypatch.setattr("shea_halo.agent.agent_span", lambda *_args, **_kwargs: Span())
     monkeypatch.setattr("shea_halo.agent.Runner.run", run)
     monkeypatch.setenv("OPENAI_API_KEY", "test-runtime-key")
@@ -225,11 +221,22 @@ def test_target_environment_is_explicit_and_collector_ready(
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-do-not-pass")
     monkeypatch.delenv("CATALYST_OTLP_ENDPOINT", raising=False)
 
-    environment = target_environment(HaloConfig.load(tmp_path))
+    environment = target_environment(
+        HaloConfig.load(tmp_path),
+        service_version="c" * 40,
+        halo_run_id="halo-26-correlation",
+        issue_number=26,
+        candidate_revision="c" * 40,
+    )
 
     assert "OPENAI_API_KEY" not in environment
     assert environment["CATALYST_OTLP_ENDPOINT"] == "http://127.0.0.1:8799"
     assert environment["CATALYST_SERVICE_NAME"] == "failurereport"
+    assert environment["CATALYST_SERVICE_VERSION"] == "c" * 40
+    assert environment["SHEA_HALO_RUN_ID"] == "halo-26-correlation"
+    assert environment["SHEA_HALO_TARGET_REPOSITORY"] == "Alive24/FailureReport"
+    assert environment["SHEA_HALO_ISSUE_NUMBER"] == "26"
+    assert environment["SHEA_HALO_CANDIDATE_REVISION"] == "c" * 40
 
 
 def test_desktop_signal_url_override_is_normalized_for_the_catalyst_sdk(

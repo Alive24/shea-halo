@@ -17,7 +17,11 @@ dependencies = [
   "halo-engine==0.2.1",
   "inference-catalyst-tracing[openai-agents]==0.1.8",
   "openai-agents==0.14.7",
+  "opentelemetry-exporter-otlp-proto-common==1.44.0",
+  "opentelemetry-sdk==1.44.0",
   "pydantic==2.13.3",
+  "protobuf==7.35.1",
+  "requests==2.34.2",
 ]
 
 [project.urls]

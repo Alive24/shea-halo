@@ -280,3 +280,11 @@ class WorkpadEntry(StrictModel):
     predecessor_comment_id: int | None
     producer: str
     state: HaloState
+    details_compacted: bool = False
+    details_sha256: str | None = Field(default=None, min_length=64, max_length=64)
+
+    @model_validator(mode="after")
+    def _compaction_has_receipt(self) -> WorkpadEntry:
+        if self.details_compacted != (self.details_sha256 is not None):
+            raise ValueError("compacted workpad details require exactly one SHA-256 receipt")
+        return self

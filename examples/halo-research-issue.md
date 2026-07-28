@@ -17,7 +17,7 @@ Describe the agent-loop or harness outcome to improve. State the user-visible or
 - Record facts, hypotheses, experiments, and residual risks in append-only Halo workpad comments.
 - Resolve tracing changes against the current official Inference catalog rather than remembered setup code; record dependency evidence, guide URL, retrieval time, digest, staleness, and selection reason.
 - Publish the experimental snapshot before final validation, then run setup, runtime experiments, and deterministic verification against that exact SHA.
-- Make each tracing experiment export standard OTLP and atomically write canonical one-span-per-line JSONL; it must fail if exporter flush or delivery fails.
+- Make each tracing experiment use framework-native tracing, offer standard OTLP to the configured loopback observer, and atomically write canonical one-span-per-line JSONL; it must fail if canonical JSONL flush or finalization fails, while an absent optional viewer is supplemental status.
 - Attribute candidate traces only to the post-setup runtime-experiment window, and reject candidates changed by later verification.
 - Prove experimental changes with a new candidate trace hierarchy, exact-dataset HALO Engine analysis, a matching dataset revision and trace `service.version`, and deterministic verification.
 - Record HALO Desktop reports as supplemental evidence when they are available; do not require Desktop to promote an otherwise complete investigation.

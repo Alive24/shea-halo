@@ -49,6 +49,7 @@ from shea_halo.service import (
     _provider_api_mode_blocker,
     _runtime_source_sha256,
 )
+from shea_halo.tracing import ResearchTracing
 from shea_halo.workpad import WorkpadHead, find_head, next_entry, render_entry
 from shea_halo.workspace import HaloWorkspace, WorkspaceManager
 
@@ -1154,7 +1155,7 @@ async def test_service_runs_desktop_preflight_only_when_explicitly_enabled(
         assert validation_receipts == [None]
 
 
-async def test_service_routes_one_sanitized_blocker_for_failed_desktop_preflight(
+async def test_failed_desktop_preflight_is_supplemental_and_sanitized(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1187,7 +1188,7 @@ async def test_service_routes_one_sanitized_blocker_for_failed_desktop_preflight
     manager = _FakeWorkspaceManager(tmp_path)
     investigator = _FakeInvestigator()
     endpoint = "http://127.0.0.1:48799/private-endpoint"
-    credential = "credential-shaped-value-never-persisted"
+    validation_receipts: list[object] = []
 
     async def rejected_preflight(
         *_args: object,
@@ -1206,9 +1207,14 @@ async def test_service_routes_one_sanitized_blocker_for_failed_desktop_preflight
 
     monkeypatch.setenv("OPENAI_API_KEY", "test")
     monkeypatch.setenv("CATALYST_OTLP_ENDPOINT", endpoint)
-    monkeypatch.setenv("CATALYST_OTLP_TOKEN", credential)
     monkeypatch.setattr("shea_halo.service.WorkspaceManager", lambda _config: manager)
     monkeypatch.setattr("shea_halo.service.preflight_halo_desktop", rejected_preflight)
+
+    async def validate_candidate(_service: HaloService, **kwargs: object) -> None:
+        preliminary = cast(InvestigationResult, kwargs["preliminary_result"])
+        validation_receipts.append(preliminary.desktop_preflight)
+
+    monkeypatch.setattr(HaloService, "_validate_candidate", validate_candidate)
 
     await HaloService(
         [config],
@@ -1221,23 +1227,13 @@ async def test_service_routes_one_sanitized_blocker_for_failed_desktop_preflight
         issue,
     )
 
-    assert investigator.calls == 0
-    assert github.statuses == ["Need Human Input"]
-    head = find_head(
-        github.comments,
-        repository=config.repository,
-        issue_number=issue.number,
-        trusted_producers={"halo-bot"},
-    )
-    assert head is not None
-    assert head.entry.state.result is not None
-    assert head.entry.state.result.desktop_preflight is not None
-    assert head.entry.state.result.desktop_preflight.classification == "rejected_ingest"
-    assert head.entry.state.result.blocker is not None
-    assert head.entry.state.result.blocker_verified is True
+    assert investigator.calls == 1
+    assert github.statuses == []
+    assert len(validation_receipts) == 1
+    receipt = cast(HaloDesktopPreflightReceipt, validation_receipts[0])
+    assert receipt.classification == "rejected_ingest"
     durable_workpad = "\n".join(comment.body for comment in github.comments)
     assert endpoint not in durable_workpad
-    assert credential not in durable_workpad
 
 
 def test_finish_persists_pending_then_applied_status_transition(tmp_path: Path) -> None:
@@ -1299,6 +1295,78 @@ def test_finish_persists_pending_then_applied_status_transition(tmp_path: Path) 
     assert pending.entry.state.status_transition is not None
     assert pending.entry.state.status_transition.state == "pending"
     assert pending.entry.state.status_transition.created_at == transition.created_at
+
+
+def test_completed_result_finalizes_trace_before_workpad_publication(
+    tmp_path: Path,
+) -> None:
+    write_target_config(tmp_path)
+    config = HaloConfig.load(tmp_path)
+    issue = _issue(config)
+    initial_state = HaloState(
+        issue_repository=config.repository,
+        issue_number=issue.number,
+        run_id="halo-20-finalize-first",
+        phase="research",
+        workspace_branch="halo/issue-20-improve-eve-tracing",
+    )
+    initial_entry = next_entry(initial_state, None, producer="halo-bot")
+    order: list[str] = []
+
+    class Tracing:
+        def attach_result(self, _result: InvestigationResult) -> None:
+            order.append("attach_result")
+
+        def finalize_run(self, _outcome: str) -> Path:
+            order.append("finalize_run")
+            return tmp_path / "manifest.json"
+
+    class FailingGitHub(_FakeGitHub):
+        def add_comment(
+            self,
+            _repository: str,
+            _number: int,
+            body: str,
+        ) -> IssueComment:
+            del body
+            order.append("add_comment")
+            raise RuntimeError("GitHub comment unavailable")
+
+    github = FailingGitHub(
+        [
+            IssueComment(
+                database_id=100,
+                author="halo-bot",
+                body=render_entry(initial_entry, "Claimed."),
+                created_at="2026-07-24T00:00:00Z",
+            )
+        ]
+    )
+    state = initial_state.model_copy(
+        update={
+            "result": InvestigationResult(
+                outcome=Outcome.CONTINUE_RESEARCH,
+                summary="The run completed with a recoverable result.",
+            )
+        }
+    )
+    service = HaloService(
+        [config],
+        investigator=cast(Investigator, _FakeInvestigator()),
+        tracing=cast(ResearchTracing, Tracing()),
+    )
+
+    with pytest.raises(RuntimeError, match="comment unavailable"):
+        service._append_result(
+            cast(GitHubClient, github),
+            issue,
+            WorkpadHead(comment_id=100, entry=initial_entry),
+            "halo-bot",
+            state,
+            "Recorded the result.",
+        )
+
+    assert order == ["attach_result", "finalize_run", "add_comment"]
 
 
 def test_terminal_item_reconciles_applied_comment_after_status_write(tmp_path: Path) -> None:
@@ -1975,6 +2043,7 @@ async def test_validating_reentry_uses_the_original_persisted_observation_baseli
         kind: str,
         stage: str,
         service_version: str,
+        **_kwargs: object,
     ) -> list[ExecutedAction]:
         index = 0 if kind == "setup" else 1
         return [
@@ -1998,6 +2067,7 @@ async def test_validating_reentry_uses_the_original_persisted_observation_baseli
         _workspace: Path,
         *,
         service_version: str,
+        **_kwargs: object,
     ) -> tuple[list[Verification], list[ExecutedAction]]:
         action = ExecutedAction(
             index=2,

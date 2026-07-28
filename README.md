@@ -87,23 +87,39 @@ For FailureReport, the live dependency scan finds `eve ^0.24.4` and selects the 
 
 The interoperability boundary is OpenInference-shaped OpenTelemetry:
 
-- live local observation uses any reachable standard OTLP-compatible collector; HALO Desktop is the default richer observation surface;
+- live local observation uses an optional standard OTLP-compatible collector on literal loopback; HALO Desktop is the default richer observation surface;
 - offline analysis uses canonical JSONL with one span per line;
 - `halo-engine` consumes that canonical dataset through its public async Python API;
 - exported Desktop `report.md` files can be supplied as optional, bounded plain-text evidence;
 - Shea Halo never reads Desktop SQLite, calls private Desktop APIs, or invents another span schema.
 
-`catalyst_sdk_base_endpoint` identifies HALO Desktop or another reachable HTTP(S) OTLP collector. It accepts either the SDK base URL or a full signal URL ending in `/v1/traces`; Halo normalizes the latter to the base because the pinned Catalyst SDK appends that route. The `CATALYST_OTLP_ENDPOINT` override follows the same rule, so the endpoint copied from HALO Desktop's own instructions works unchanged.
+`catalyst_sdk_base_endpoint` identifies HALO Desktop or another operator-managed
+HTTP(S) OTLP collector. It accepts either the SDK base URL or a full signal URL
+ending in `/v1/traces`; Halo normalizes the latter to the base. The configured
+URL and `CATALYST_OTLP_ENDPOINT` override must use the literal host `127.0.0.1`
+or `::1`. DNS names, credentials in URLs, LAN/public addresses, redirects, and
+hosted Catalyst destinations fail closed before trace payload egress.
 
 Generic collectors remain the default: when `observation.desktop_preflight` is absent or set to `disabled`, Halo does not probe the endpoint. Operators who explicitly set `desktop_preflight = "external"` ask Halo to make one bounded pre-research check against only the derived `GET /health` and OTLP/JSON `POST /v1/traces` paths. The check follows no redirects and sends a deterministic synthetic span with no model I/O, tool data, credentials, endpoint data, or host paths. Its workpad receipt contains only the mode, allowlisted Desktop service identity, HTTP status classes, timestamps, payload digest, and pass/fail classification.
 
-External mode never starts, stops, discovers, enumerates, signals, configures, or otherwise owns the Desktop process. A successful POST is only an ingest-acceptance receipt: Halo does not read Desktop SQLite, tRPC, WebSockets, application-data paths, or trace lists, and cannot verify durable storage or UI visibility. Canonical JSONL candidate traces remain the required promotion evidence.
+External mode never starts, stops, discovers, enumerates, signals, configures,
+or otherwise owns the Desktop process. A successful POST is only an
+ingest-acceptance receipt: Halo does not read Desktop SQLite, tRPC, WebSockets,
+application-data paths, or trace lists, and cannot verify durable storage or UI
+visibility. A failed or unavailable optional viewer is recorded as a bounded
+observation classification and does not block canonical local evidence.
 
 Trace discovery covers both the observed checkout and the active experiment worktree. Each canonical record is validated against HALO Engine's public `SpanRecord` contract, including full trace/span identifiers and required span structure, before analysis begins.
 
 The investigator reads that JSON schema directly from the installed public `halo-engine` model before it designs a capture path. Shea Halo therefore does not duplicate or freeze a private canonical schema in framework-specific instructions.
 
-Every real tracing experiment has a dual-output contract. It must export the same instrumented run to the configured standard OTLP endpoint and atomically write canonical one-span-per-line JSONL under one of `trace_globs`. The target-owned experiment must await exporter flush/shutdown and exit nonzero if OTLP delivery is rejected; Halo treats the allowlisted action's successful exit as its delivery receipt. There is intentionally no Desktop-to-JSONL bridge and no Shea-specific receiver.
+Every real tracing experiment has a native-first capture contract. It offers
+the same instrumented run to the configured loopback OTLP observer and
+atomically writes canonical one-span-per-line JSONL under one of `trace_globs`.
+The target-owned experiment must await exporter flush/shutdown and exit nonzero
+when canonical JSONL cannot be persisted or finalized. Viewer absence does not
+invalidate a completed target-native dataset. There is intentionally no
+Desktop-to-JSONL bridge and no Shea-specific receiver.
 
 An experimental code change cannot move to `Todo` from source diff and model claims alone. Halo requires a successful post-publication runtime experiment, a new or changed canonical candidate trace with an actual parent/child hierarchy, post-experiment HALO Engine analysis of exactly that candidate dataset, passing deterministic verification, and the exact published candidate revision. The same trace contract applies when a tracing experiment concludes `no_change`. A HALO Desktop report remains useful supplemental evidence when available, but is not a promotion requirement. Missing required evidence leaves the item in `Halo Research` for the next re-entry.
 
@@ -113,6 +129,41 @@ HALO Engine artifacts are local and ignored under `.shea/artifacts/halo/<run-id>
 - `events.jsonl` — bounded, sanitized event summaries;
 - `report.md` — the sanitized HALO report;
 - `halo-telemetry.jsonl` — a sanitized local copy of HALO's own telemetry.
+
+## Research trace bundles
+
+The worker initializes `inference-catalyst-tracing` once for its process
+lifetime and retains its native OpenAI Agents instrumentation. Each claimed
+research attempt creates one `shea-halo.research` root span and bounded Shea
+stage spans around control-plane work that native instrumentation does not
+cover. The same ended OpenTelemetry span objects fan out to the optional
+loopback OTLP observer and a local canonical exporter.
+
+Bundles live under the ignored, permission-restricted directory
+`.shea/artifacts/halo/research-traces/<trace-bundle-id>/`:
+
+- `control-plane.jsonl` contains canonical HALO Engine `SpanRecord` rows,
+  including original trace/span/parent IDs, timestamps, status, resource,
+  scope, attributes, events, and links;
+- `manifest.json` contains only bounded counts, digests, service identities,
+  revisions, safe run/issue/repository correlation, and logical references to
+  target-native trace and HALO Engine artifacts;
+- `*.incomplete` and `manifest.incomplete.json` identify interrupted or failed
+  captures and are never promotion evidence.
+
+The JSONL may contain prompts, responses, and tool payloads. Keep the entire
+bundle inside ignored runtime storage with its default restrictive permissions;
+do not paste it into Issues, workpads, logs, PRs, or other public evidence.
+Choose a local retention period appropriate to the target's data and remove
+expired bundle directories only while the worker is stopped. After a crash,
+inspect the safe incomplete manifest for classification, preserve the spool
+only for local diagnosis, and rerun the research item to produce a new bundle;
+never rename an incomplete spool into canonical evidence by hand.
+
+HALO Desktop can inspect a bundle either live through the configured loopback
+OTLP endpoint or by importing `control-plane.jsonl` through its public file
+import UI. HALO Engine consumes the same file directly through its public API.
+This is Catalyst-native local telemetry, not a self-hosted Catalyst backend.
 
 HALO Engine indexes and raw intermediate events live only in a per-run temporary directory. Host paths and credential-shaped values are removed before durable artifacts or public workpads are written. Live OTLP sent by the observed target to the configured Desktop or collector remains a trusted observation boundary and may contain application data; operators must secure that endpoint and choose target instrumentation deliberately.
 
@@ -232,10 +283,12 @@ Shea Halo is a long-running local worker because experiments need the target's r
 - `SHEA_HALO_TARGETS`: local target checkout roots separated by the platform path separator;
 - `OPENAI_API_KEY`: used by OpenAI Agents SDK and HALO Engine;
 - GitHub authentication through `gh` or `GH_TOKEN`, with repository and Project access;
-- optional `CATALYST_OTLP_ENDPOINT`, `CATALYST_OTLP_TOKEN`, and `CATALYST_SERVICE_NAME`;
+- optional loopback-only `CATALYST_OTLP_ENDPOINT`;
 - optional `DENO_DIR`: a persistent writable Deno cache for restricted launchers that cannot write Deno's normal user cache.
 
-If `CATALYST_OTLP_ENDPOINT` is absent, the configured Catalyst SDK base endpoint is used. Credentials are runtime configuration and are never written to target config, artifacts, workpads, or branches.
+If `CATALYST_OTLP_ENDPOINT` is absent, the configured Catalyst SDK base endpoint
+is used. `CATALYST_OTLP_TOKEN` and the legacy OTLP ingest token are rejected in
+local-only mode; a loopback observer requires no trace credential.
 
 Repository experiment and verification processes receive a credential-scrubbed environment. Their raw output is shown to the active investigator only after redaction; GitHub receives exit status and output digests, not stdout or stderr. Before a branch is staged, Halo rejects sensitive paths, known credential material, common token forms, path escapes, and oversized files.
 
