@@ -33,8 +33,9 @@ By the end of the demo, the audience should understand:
 
 - One fresh FailureReport research Issue pinned to the then-current
   FailureReport `main`.
-- A pre-captured, sanitized, real FailureReport trace bundle produced through
-  the completed Issue #9 pipeline.
+- One freshly generated, finalized, sanitized real FailureReport research trace
+  bundle produced by the golden run through the completed Issue #9 pipeline,
+  then frozen for rehearsal and presentation.
 - Framework-native Eve/Catalyst coverage analysis.
 - A concrete handoff for an uncovered FailureReport semantic boundary.
 - A visible `Halo Research` → `Todo` transition.
@@ -50,6 +51,12 @@ By the end of the demo, the audience should understand:
 - Claiming production stability beyond the current Alpha status.
 
 ## Target demo story
+
+This is the target story, not a pre-authorized conclusion for the research
+agent. The fresh Issue must ask Halo to verify native coverage and identify any
+remaining semantic gap. If exact-revision evidence does not support the expected
+Codex App Server lifecycle finding, preserve the evidence-bound result and use
+the conditional demo rather than forcing this narrative.
 
 FailureReport asks Shea Halo to improve trace coverage for its Root/Codex
 diagnostic loop.
@@ -70,7 +77,8 @@ rollups are not duplicated.
 The demo is ready only when all of the following are true:
 
 - [ ] The machine used for the demo is running a Shea Halo build containing the
-      merged Issue #9 trace-bundle implementation.
+      merged Issue #9 trace-bundle implementation and merged Issue #13
+      human-readable handoff implementation.
 - [ ] The human-readable Research Summary and Proposed Handoff are visible
       without opening the structured workpad JSON.
 - [ ] The demo uses a new FailureReport research Issue; Issue #26 is linked as
@@ -79,6 +87,10 @@ The demo is ready only when all of the following are true:
 - [ ] The selected trace bundle has a bounded manifest, exact source revision,
       canonical trace identities, and no raw secrets or host paths in public
       evidence.
+- [ ] The selected target-native traces were generated after the golden
+      candidate revision was fixed; historical FailureReport #26 traces are
+      context only and are not presented as promotion evidence for the fresh
+      Issue.
 - [ ] Candidate trace validation, HALO dataset validation, revision validation,
       `service.version` validation, and repository verification all pass.
 - [ ] The Project item reaches `Todo`.
@@ -91,10 +103,77 @@ The demo is ready only when all of the following are true:
 
 ## Critical path before Friday
 
+Only two tracker items are on the critical path:
+
+1. Complete Shea Halo
+   [#13](https://github.com/Alive24/shea-halo/issues/13), merge it, and freeze
+   the resulting Shea Halo `main` revision.
+2. Create one fresh FailureReport `Halo Research` Issue after #13 is merged and
+   run it until the same Project item reaches `Todo`.
+
+FailureReport #26 remains historical evidence. Shea Halo #7 workpad coalescing
+remains outside the critical path unless the golden run demonstrates a concrete
+revision storm that prevents completion.
+
+### Golden-run experiment preflight
+
+Do not create the fresh Research Issue until the ignored FailureReport
+`.shea/halo.local.toml` runs a real target-owned candidate experiment.
+
+The pre-demo configuration still stages the retained #26 analysis JSONL with a
+`cp` action. That was valid for re-entry against the old exact candidate, but it
+cannot prove a fresh Issue or current candidate revision. Remove that action
+from the frozen demo configuration.
+
+The replacement experiment must:
+
+- run from the managed candidate worktree after its revision is fixed;
+- receive the candidate SHA through `CATALYST_SERVICE_VERSION`;
+- use an operator-approved fixture Issue and immutable target revision;
+- exercise the real Eve Root → diagnostic session → Codex path;
+- use Eve/Catalyst-native tracing and a loopback-only OTLP path;
+- atomically finalize new canonical JSONL while preserving trace IDs, span IDs,
+  parent IDs, timestamps, resource identity, and exact `service.version`;
+- exit nonzero if the real flow, JSONL finalization, or required trace
+  invariants fail;
+- leave raw traces in ignored local storage and emit only bounded receipts;
+- prove the selected observation is new or changed after the candidate
+  validation baseline.
+
+Run this experiment once against a disposable fixture before creating the
+golden Issue. If it cannot produce fresh exact-revision JSONL, the end-to-end
+demo is not ready even when historical #26 traces remain available.
+
+### Post-#13 execution sequence
+
+After #13 is merged:
+
+1. Read back #13 as `Done`, record the merge SHA, and update the demo worker to
+   that exact clean `main`.
+2. Confirm the worker build contains both the #9 research-bundle lifecycle and
+   #13 visible decision/handoff projection.
+3. Replace the historical-trace `cp` action in the ignored FailureReport Halo
+   configuration with the real candidate experiment defined above.
+4. Run that experiment against a disposable operator-approved fixture. Stop if
+   its JSONL is absent, incomplete, stale, mixed-revision, or not accepted by
+   HALO Engine.
+5. Refresh the prepared golden Research Issue contract against current
+   FailureReport `main`, then create it and place it in `Halo Research`.
+6. Run Shea Halo to a deterministic terminal disposition. Do not manually move
+   the Issue to make the demo story succeed.
+7. For `ready_for_todo`, read back the visible Research Summary, Evidence Gates,
+   Proposed Handoff, final Project `Todo` status, and complete local bundle.
+   For `no_change`, incomplete evidence, or a verified blocker, preserve that
+   result and switch the presentation plan to Conditional Go.
+8. Freeze all identities and presentation artifacts before the final
+   rehearsal; do not reuse the golden Issue for another technical run.
+
 ### Tuesday, 28 July — freeze the scope
 
 - Confirm Issue #9 is merged into the `main` revision used by the worker.
-- Define the human-readable Research Summary / Proposed Handoff presentation.
+- Complete Issue #13 through review, UAT, merge, and `Done`.
+- Define and verify the human-readable Research Summary / Proposed Handoff
+  presentation.
 - Keep workpad coalescing, provider retry policy, Chat Completions compatibility,
   and broader automation outside the demo critical path unless they directly
   break the selected run.
@@ -104,16 +183,22 @@ The demo is ready only when all of the following are true:
 
 ### Wednesday, 29 July — produce the golden run
 
-- Update the demo machine to the frozen Shea Halo revision.
+- Update the demo machine to the frozen Shea Halo revision containing #9 and
+  #13.
 - Create a new FailureReport Issue with the focused tracing-coverage objective.
 - Add it to the configured FailureReport Project in `Halo Research`.
-- Run Shea Halo using the known trace bundle and pinned model/API mode.
+- Run Shea Halo using the pinned model/API mode. Let the exact-revision
+  candidate experiment produce the target-native traces and let the completed
+  #9 pipeline finalize this run's new research bundle.
 - Resolve only defects that block:
   - exact trace validation;
   - human-readable handoff rendering;
   - deterministic routing to `Todo`.
 - Record the successful Issue URL, base revision, candidate revision, bundle
   identity, HALO report digest, and final Project status.
+- Record the demo-relevant #9 UAT evidence from the same run: finalized local
+  bundle, accepted HALO Engine dataset, identity preservation, and absence of
+  raw trace content from public evidence. HALO Desktop remains optional.
 
 ### Thursday, 30 July — rehearse and freeze
 
