@@ -345,7 +345,11 @@ def test_failure_report_126_shape_visibly_rejects_verification_receipts_as_exper
     assert "Deterministic verification: 4/4 passed" in visible
     assert "**Provisional — not dispatchable:**" in visible
     assert "Add one bounded Codex App Server lifecycle span." in visible
-    assert "Model-authored context only" in visible
+    assert (
+        "**Model-authored context only — rejected terminal wording is non-authoritative.**"
+        in visible
+    )
+    assert "[REDACTED]" not in visible
     assert "### Model-authored residual risks" in visible
     assert HaloService._gate_outcome(gated) == gated
 

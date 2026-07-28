@@ -347,10 +347,12 @@ def _result_sections(result: InvestigationResult, *, phase: str) -> str:
     gate_failed = (
         result.gate_disposition is not None and result.gate_disposition.status == GateStatus.FAILED
     )
-    summary_label = (
-        "Model-authored context only; its rejected terminal wording is not authoritative"
+    visible_summary = _visible_text(result.summary, _VISIBLE_SUMMARY_CHARS)
+    summary_line = (
+        "**Model-authored context only — rejected terminal wording is non-authoritative.** "
+        f"{visible_summary}"
         if gate_failed
-        else "Result summary"
+        else f"**Result summary:** {visible_summary}"
     )
 
     if result.todo_handoff is None or not result.todo_handoff.strip():
@@ -414,7 +416,7 @@ def _result_sections(result: InvestigationResult, *, phase: str) -> str:
 - Lifecycle phase: `{phase}`
 - Disposition: {outcome_text}
 
-**{summary_label}:** {_visible_text(result.summary, _VISIBLE_SUMMARY_CHARS)}
+{summary_line}
 
 ### Evidence gates
 
