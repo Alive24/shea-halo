@@ -22,6 +22,7 @@ from shea_halo.models import (
     ExecutedAction,
     Experiment,
     ExternalBlocker,
+    GateStatus,
     GuideSnapshot,
     HaloDesktopPreflightClassification,
     HaloDesktopPreflightReceipt,
@@ -155,6 +156,8 @@ def test_routes_only_completed_research_to_symphony_todo(tmp_path: Path) -> None
 
     assert ready[:2] == ("ready", "Todo")
     assert continuing[:2] == ("research", None)
+    assert ready_result.gate_disposition is not None
+    assert ready_result.gate_disposition.status == GateStatus.PASSED
 
 
 def test_runtime_source_digest_is_stable_and_tracks_code_changes(tmp_path: Path) -> None:
@@ -255,11 +258,18 @@ def test_ready_gate_rejects_incomplete_or_stale_evidence() -> None:
     assert incomplete.outcome == Outcome.CONTINUE_RESEARCH
     assert stale.outcome == Outcome.CONTINUE_RESEARCH
     assert no_runtime_trace.outcome == Outcome.CONTINUE_RESEARCH
-    assert any("current framework guide" in risk for risk in stale.residual_risks)
-    assert any("candidate trace hierarchy" in risk for risk in no_runtime_trace.residual_risks)
+    assert stale.gate_disposition is not None
+    assert stale.gate_disposition.status == GateStatus.FAILED
+    assert any("current framework guide" in reason for reason in stale.gate_disposition.reasons)
+    assert no_runtime_trace.gate_disposition is not None
+    assert any(
+        "candidate trace hierarchy" in reason
+        for reason in no_runtime_trace.gate_disposition.reasons
+    )
+    assert stale.residual_risks == []
 
 
-def test_ready_gate_rejects_verification_receipts_reclassified_as_experiments() -> None:
+def test_failure_report_126_shape_visibly_rejects_verification_receipts_as_experiments() -> None:
     ready = _ready_result()
     verification_action = ExecutedAction(
         index=2,
@@ -273,6 +283,7 @@ def test_ready_gate_rejects_verification_receipts_reclassified_as_experiments() 
     )
     invalid = ready.model_copy(
         update={
+            "summary": ("Research is complete and supports a concrete implementation handoff."),
             "experiments": [
                 *ready.experiments,
                 Experiment(
@@ -283,13 +294,64 @@ def test_ready_gate_rejects_verification_receipts_reclassified_as_experiments() 
                 ),
             ],
             "executed_actions": [*ready.executed_actions, verification_action],
+            "verification": [
+                Verification(
+                    command=["pnpm", command],
+                    status="passed",
+                    evidence="exit_code=0",
+                )
+                for command in ("build", "check", "test", "format:check")
+            ],
+            "residual_risks": ["The before/after trace comparison remains model-authored risk."],
+            "todo_handoff": "Add one bounded Codex App Server lifecycle span.",
         }
     )
 
     gated = HaloService._gate_outcome(invalid)
+    rendered = render_entry(
+        next_entry(
+            HaloState(
+                issue_repository="Alive24/FailureReport",
+                issue_number=26,
+                run_id="halo-26-regression",
+                phase="research",
+                workspace_branch="halo/issue-26-improve-tracing",
+                base_revision="a" * 40,
+                branch=BranchSnapshot(
+                    name="halo/issue-26-improve-tracing",
+                    head_revision="1" * 40,
+                ),
+                result=gated,
+            ),
+            None,
+            producer="halo-bot",
+        ),
+        "Research and experiments are complete.",
+    )
+    visible = rendered.split("<details>", 1)[0]
 
     assert gated.outcome == Outcome.CONTINUE_RESEARCH
-    assert any("runtime actions" in risk for risk in gated.residual_risks)
+    assert gated.gate_disposition is not None
+    assert gated.gate_disposition.status == GateStatus.FAILED
+    assert any("runtime actions" in reason for reason in gated.gate_disposition.reasons)
+    assert gated.residual_risks == invalid.residual_risks
+    assert "- Outcome: `continue_research`" in visible
+    assert "proposed outcome `ready_for_todo` was rejected" in visible
+    assert (
+        "A Todo handoff requires completed experiments bound to successful "
+        "revision-bound runtime actions."
+    ) in visible
+    assert "Trace validation: **PASS**" in visible
+    assert "Deterministic verification: 4/4 passed" in visible
+    assert "**Provisional — not dispatchable:**" in visible
+    assert "Add one bounded Codex App Server lifecycle span." in visible
+    assert (
+        "**Model-authored context only — rejected terminal wording is non-authoritative.**"
+        in visible
+    )
+    assert "[REDACTED]" not in visible
+    assert "### Model-authored residual risks" in visible
+    assert HaloService._gate_outcome(gated) == gated
 
 
 def test_ready_gate_requires_every_runtime_experiment_at_exact_candidate_revision() -> None:
@@ -308,7 +370,10 @@ def test_ready_gate_requires_every_runtime_experiment_at_exact_candidate_revisio
     )
 
     assert gated.outcome == Outcome.CONTINUE_RESEARCH
-    assert any("revision-bound runtime actions" in risk for risk in gated.residual_risks)
+    assert gated.gate_disposition is not None
+    assert any(
+        "revision-bound runtime actions" in reason for reason in gated.gate_disposition.reasons
+    )
 
 
 def test_trace_validation_is_bound_to_post_experiment_engine_dataset() -> None:
@@ -697,6 +762,8 @@ def test_no_change_gate_requires_evidence_experiments_and_no_changed_paths() -> 
     assert incomplete.outcome == Outcome.CONTINUE_RESEARCH
     assert contradictory.outcome == Outcome.CONTINUE_RESEARCH
     assert complete.outcome == Outcome.NO_CHANGE
+    assert complete.gate_disposition is not None
+    assert complete.gate_disposition.status == GateStatus.PASSED
 
 
 def test_no_change_tracing_snapshot_requires_the_same_trace_contract_as_todo() -> None:
@@ -748,6 +815,8 @@ def test_blocked_gate_requires_structured_external_blocker() -> None:
     assert unsupported.outcome == Outcome.CONTINUE_RESEARCH
     assert empty.outcome == Outcome.CONTINUE_RESEARCH
     assert supported.outcome == Outcome.BLOCKED
+    assert supported.gate_disposition is not None
+    assert supported.gate_disposition.status == GateStatus.PASSED
 
 
 def test_blocker_is_reverified_only_from_the_exact_revision_action() -> None:
