@@ -7,7 +7,7 @@ from typing import Annotated, Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from shea_halo.observation import ObservationCheckpoint, TraceValidation
-from shea_halo.provider import ApiMode
+from shea_halo.provider import ApiMode, ProviderAvailabilityReceipt
 
 
 class StrictModel(BaseModel):
@@ -194,6 +194,7 @@ class InvestigationResult(StrictModel):
     todo_handoff: str | None = Field(default=None, max_length=4_000)
     blocker: ExternalBlocker | None = None
     blocker_verified: bool = False
+    provider_availability: ProviderAvailabilityReceipt | None = None
     desktop_preflight: HaloDesktopPreflightReceipt | None = None
 
     @model_validator(mode="after")

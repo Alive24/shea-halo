@@ -42,7 +42,13 @@ from shea_halo.observation import (
     discard_worktree_observation_changes,
     inventory_observations,
 )
-from shea_halo.provider import ApiMode, ProviderApiModeError
+from shea_halo.provider import (
+    ApiMode,
+    ProviderApiModeError,
+    ProviderAvailabilityBlockedError,
+    ProviderAvailabilityPolicy,
+    ProviderBlockerClassification,
+)
 from shea_halo.runtime_fs import append_runtime_text
 from shea_halo.security import sanitize_persisted_data, sanitize_persisted_text
 from shea_halo.tracing import ResearchTracing
@@ -191,6 +197,47 @@ def _provider_api_mode_blocker(
     return InvestigationResult.model_validate(previous.model_copy(update=update).model_dump())
 
 
+def _provider_availability_blocker(
+    error: ProviderAvailabilityBlockedError,
+    *,
+    previous: InvestigationResult | None = None,
+) -> InvestigationResult:
+    """Persist one recoverable provider blocker without retaining provider details."""
+
+    classification = error.receipt.classification
+    if classification == ProviderBlockerClassification.QUOTA_EXHAUSTED:
+        description = "The configured provider explicitly reported exhausted usage or quota."
+    else:
+        description = "The configured provider declared a cooldown beyond Halo's retry budget."
+    risk = (
+        "Provider availability was terminally classified as "
+        f"`{classification.value}` after {error.receipt.retries_used} shared retry attempt(s) "
+        f"and {error.receipt.waited_seconds:g} seconds of provider-directed waiting."
+    )
+    update = {
+        "outcome": Outcome.BLOCKED,
+        "summary": "The configured model provider is unavailable for this research run.",
+        "residual_risks": _bounded_residual_risks(
+            (*(previous.residual_risks if previous is not None else ()), risk),
+            retain=(risk,),
+        ),
+        "todo_handoff": None,
+        "blocker": ExternalBlocker(
+            category="service_unavailable",
+            description=description,
+            required_action=(
+                "Restore the configured provider capability, then return the item to Halo "
+                "Research. Halo's next normal model operation will verify recovery."
+            ),
+        ),
+        "blocker_verified": True,
+        "provider_availability": error.receipt,
+    }
+    if previous is None:
+        return InvestigationResult(**update)
+    return InvestigationResult.model_validate(previous.model_copy(update=update).model_dump())
+
+
 class HaloService:
     def __init__(
         self,
@@ -290,6 +337,7 @@ class HaloService:
             if head is not None
             else f"halo-{issue.number}-{uuid.uuid4().hex[:12]}"
         )
+        provider_policy = ProviderAvailabilityPolicy()
         if head is None:
             state = HaloState(
                 issue_repository=issue.repository,
@@ -422,6 +470,7 @@ class HaloService:
                 snapshot=snapshot,
                 preliminary_result=pending_result,
                 discussion=discussion,
+                provider_policy=provider_policy,
             )
             return
 
@@ -464,6 +513,7 @@ class HaloService:
                 snapshot=head.entry.state.branch,
                 preliminary_result=preliminary_result,
                 discussion=discussion,
+                provider_policy=provider_policy,
             )
             return
 
@@ -618,12 +668,14 @@ class HaloService:
 
         try:
             with self.tracing.stage("halo-engine-analysis"):
-                halo_analysis = await self.halo_engine.analyze(
-                    config=config,
-                    workspace=workspace,
-                    run_id=run_id,
-                    issue_title=issue.title,
-                    issue_body=issue.body,
+                halo_analysis = await provider_policy.run(
+                    lambda: self.halo_engine.analyze(
+                        config=config,
+                        workspace=workspace,
+                        run_id=run_id,
+                        issue_title=issue.title,
+                        issue_body=issue.body,
+                    )
                 )
             result = await self.investigator.run(
                 config=config,
@@ -635,8 +687,49 @@ class HaloService:
                 issue_discussion=discussion,
                 prior_result=previous_result,
                 halo_analysis=halo_analysis,
+                provider_policy=provider_policy,
             )
             result = result.model_copy(update={"desktop_preflight": desktop_preflight})
+        except ProviderAvailabilityBlockedError as exc:
+            manager.discard_unpublished_attempt(
+                workspace,
+                issue_number=issue.number,
+                persisted_base_revision=workspace.base_revision,
+                expected_snapshot=head.entry.state.branch,
+            )
+            result = _provider_availability_blocker(exc).model_copy(
+                update={"desktop_preflight": desktop_preflight}
+            )
+            self._finish(
+                config=config,
+                github=github,
+                metadata=metadata,
+                issue=issue,
+                producer=producer,
+                head=head,
+                state=HaloState(
+                    issue_repository=issue.repository,
+                    issue_number=issue.number,
+                    run_id=run_id,
+                    phase="blocked",
+                    api_mode=config.api_mode,
+                    workspace_branch=workspace_branch,
+                    base_revision=workspace.base_revision,
+                    branch=head.entry.state.branch,
+                    input_fingerprint=input_fingerprint,
+                    result=result,
+                ),
+            )
+            self._log(
+                config,
+                issue,
+                "provider_availability_blocked",
+                {
+                    "classification": exc.receipt.classification,
+                    "run_id": run_id,
+                },
+            )
+            return
         except ProviderApiModeError as exc:
             manager.discard_unpublished_attempt(
                 workspace,
@@ -819,6 +912,7 @@ class HaloService:
             snapshot=snapshot,
             preliminary_result=result,
             discussion=discussion,
+            provider_policy=provider_policy,
         )
 
     def _reconcile_terminal_transition(
@@ -917,9 +1011,11 @@ class HaloService:
         snapshot: BranchSnapshot | None,
         preliminary_result: InvestigationResult,
         discussion: str,
+        provider_policy: ProviderAvailabilityPolicy | None = None,
     ) -> None:
         """Validate only evidence produced after the candidate revision is fixed."""
 
+        provider_policy = provider_policy or ProviderAvailabilityPolicy()
         workspace = manager.prepare_validation_workspace(
             workspace,
             issue_number=issue.number,
@@ -1115,14 +1211,53 @@ class HaloService:
         if candidate_traces:
             try:
                 with self.tracing.stage("halo-engine-analysis"):
-                    post_analysis = await self.halo_engine.analyze(
-                        config=config,
-                        workspace=workspace,
-                        run_id=f"{run_id}-candidate",
-                        issue_title=issue.title,
-                        issue_body=issue.body,
-                        trace_sha256s=frozenset(trace.sha256 for trace in candidate_traces),
+                    post_analysis = await provider_policy.run(
+                        lambda: self.halo_engine.analyze(
+                            config=config,
+                            workspace=workspace,
+                            run_id=f"{run_id}-candidate",
+                            issue_title=issue.title,
+                            issue_body=issue.body,
+                            trace_sha256s=frozenset(trace.sha256 for trace in candidate_traces),
+                        )
                     )
+            except ProviderAvailabilityBlockedError as exc:
+                manager.prepare_validation_workspace(
+                    workspace,
+                    issue_number=issue.number,
+                    persisted_base_revision=workspace.base_revision,
+                    expected_snapshot=snapshot,
+                )
+                blocked = _provider_availability_blocker(exc, previous=preliminary_result)
+                self._finish(
+                    config=config,
+                    github=github,
+                    metadata=metadata,
+                    issue=issue,
+                    producer=producer,
+                    head=head,
+                    state=HaloState(
+                        issue_repository=issue.repository,
+                        issue_number=issue.number,
+                        run_id=run_id,
+                        phase="blocked",
+                        api_mode=config.api_mode,
+                        workspace_branch=workspace_branch,
+                        base_revision=workspace.base_revision,
+                        branch=snapshot,
+                        result=blocked,
+                    ),
+                )
+                self._log(
+                    config,
+                    issue,
+                    "provider_availability_blocked",
+                    {
+                        "classification": exc.receipt.classification,
+                        "run_id": run_id,
+                    },
+                )
+                return
             except ProviderApiModeError as exc:
                 manager.prepare_validation_workspace(
                     workspace,
@@ -1211,6 +1346,7 @@ class HaloService:
                 validation_actions=validation_actions,
                 verification=verification,
                 source_clean=source_clean,
+                provider_policy=provider_policy,
             )
             validate_candidate_synthesis(
                 decision,
@@ -1219,6 +1355,43 @@ class HaloService:
                 candidate_traces=candidate_traces,
                 validation_actions=validation_actions,
             )
+        except ProviderAvailabilityBlockedError as exc:
+            manager.prepare_validation_workspace(
+                workspace,
+                issue_number=issue.number,
+                persisted_base_revision=workspace.base_revision,
+                expected_snapshot=snapshot,
+            )
+            blocked = _provider_availability_blocker(exc, previous=preliminary_result)
+            self._finish(
+                config=config,
+                github=github,
+                metadata=metadata,
+                issue=issue,
+                producer=producer,
+                head=head,
+                state=HaloState(
+                    issue_repository=issue.repository,
+                    issue_number=issue.number,
+                    run_id=run_id,
+                    phase="blocked",
+                    api_mode=config.api_mode,
+                    workspace_branch=workspace_branch,
+                    base_revision=workspace.base_revision,
+                    branch=snapshot,
+                    result=blocked,
+                ),
+            )
+            self._log(
+                config,
+                issue,
+                "provider_availability_blocked",
+                {
+                    "classification": exc.receipt.classification,
+                    "run_id": run_id,
+                },
+            )
+            return
         except ProviderApiModeError as exc:
             manager.prepare_validation_workspace(
                 workspace,
