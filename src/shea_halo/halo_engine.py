@@ -10,7 +10,8 @@ from contextlib import contextmanager
 from importlib.metadata import version
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, Any, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
+from unittest.mock import patch
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -38,6 +39,24 @@ if TYPE_CHECKING:
 
 class HaloEngineError(RuntimeError):
     pass
+
+
+@contextmanager
+def _halo_engine_without_sdk_retries() -> Iterator[None]:
+    """Patch HALO 0.2.1's public client construction for one serial engine run."""
+
+    import engine.main as engine_main
+
+    original: Callable[..., object] = engine_main.AsyncOpenAI
+
+    def no_retry_client(*args: object, **kwargs: object) -> object:
+        # HALO constructs this client internally. Keep that public integration
+        # boundary intact while delegating every retry decision to the run policy.
+        kwargs["max_retries"] = 0
+        return original(*args, **kwargs)
+
+    with patch.object(engine_main, "AsyncOpenAI", no_retry_client):
+        yield
 
 
 class TraceFile(BaseModel):
@@ -676,32 +695,35 @@ class HaloEngineAdapter:
             # HaloService processes target configs serially, preventing cross-mode
             # overlap between engine runs.
             model_bootstrap.configure_sdk_default()
-            with _halo_engine_environment(
-                config,
-                run_dir,
-                telemetry_path=raw_telemetry_path,
-            ):
-                with temporary_events_path.open("w", encoding="utf-8") as events:
-                    try:
-                        async for item in stream_engine_output_async(
-                            [AgentMessage(role="user", content=engine_prompt)],
-                            engine_config,
-                            trace_paths,
-                            telemetry=True,
-                        ):
-                            event = _event_summary(
-                                item.model_dump(mode="json"),
-                                path_labels=path_labels,
-                            )
-                            events.write(json.dumps(event, ensure_ascii=False, sort_keys=True))
-                            events.write("\n")
-                            if item.final and item.item.role == "assistant":
-                                final_message = (
-                                    item.item.content if isinstance(item.item.content, str) else ""
+            with _halo_engine_without_sdk_retries():
+                with _halo_engine_environment(
+                    config,
+                    run_dir,
+                    telemetry_path=raw_telemetry_path,
+                ):
+                    with temporary_events_path.open("w", encoding="utf-8") as events:
+                        try:
+                            async for item in stream_engine_output_async(
+                                [AgentMessage(role="user", content=engine_prompt)],
+                                engine_config,
+                                trace_paths,
+                                telemetry=True,
+                            ):
+                                event = _event_summary(
+                                    item.model_dump(mode="json"),
+                                    path_labels=path_labels,
                                 )
-                    except Exception as exc:
-                        model_bootstrap.reraise_if_unsupported(exc)
-                        raise
+                                events.write(json.dumps(event, ensure_ascii=False, sort_keys=True))
+                                events.write("\n")
+                                if item.final and item.item.role == "assistant":
+                                    final_message = (
+                                        item.item.content
+                                        if isinstance(item.item.content, str)
+                                        else ""
+                                    )
+                        except Exception as exc:
+                            model_bootstrap.reraise_if_unsupported(exc)
+                            raise
             try:
                 runtime.atomic_write_text(
                     events_path,

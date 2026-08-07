@@ -15,6 +15,7 @@ from shea_halo.halo_engine import (
     HaloEngineError,
     _clear_previous_outputs,
     _halo_engine_environment,
+    _halo_engine_without_sdk_retries,
     _managed_run_dir,
     _persist_safe_jsonl,
     _prebuild_trace_indexes_when_process_pool_unavailable,
@@ -55,6 +56,26 @@ def test_canonical_flat_jsonl_manifest(tmp_path: Path) -> None:
 
     assert trace.span_count == 1
     assert len(trace.sha256) == 64
+
+
+def test_halo_engine_compatibility_boundary_disables_sdk_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import engine.main as engine_main
+
+    observed: dict[str, object] = {}
+
+    def client(*_args: object, **kwargs: object) -> object:
+        observed.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(engine_main, "AsyncOpenAI", client)
+
+    with _halo_engine_without_sdk_retries():
+        engine_main.AsyncOpenAI(api_key="test")
+
+    assert observed == {"api_key": "test", "max_retries": 0}
+    assert engine_main.AsyncOpenAI is client
 
 
 def test_trace_index_process_pool_is_unavailable_when_semaphore_query_is_denied(

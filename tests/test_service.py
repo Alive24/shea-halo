@@ -7,8 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
 
+import httpx
 import pytest
 from conftest import write_target_config
+from openai import APIStatusError
 
 from shea_halo.agent import Investigator, candidate_evidence_references
 from shea_halo.config import HaloConfig
@@ -42,12 +44,18 @@ from shea_halo.observation import (
     TraceObservation,
     TraceValidation,
 )
-from shea_halo.provider import ProviderApiModeError
+from shea_halo.provider import (
+    ProviderApiModeError,
+    ProviderAvailabilityBlockedError,
+    ProviderAvailabilityReceipt,
+    ProviderBlockerClassification,
+)
 from shea_halo.runtime_fs import RuntimeFilesystemError
 from shea_halo.service import (
     HaloService,
     ServiceError,
     _provider_api_mode_blocker,
+    _provider_availability_blocker,
     _runtime_source_sha256,
 )
 from shea_halo.tracing import ResearchTracing
@@ -687,6 +695,29 @@ def test_provider_api_mode_blocker_is_structured_and_never_falls_back() -> None:
     assert "other API mode" in result.residual_risks[0]
 
 
+def test_provider_availability_blocker_persists_only_a_bounded_sanitized_receipt() -> None:
+    result = _provider_availability_blocker(
+        ProviderAvailabilityBlockedError(
+            ProviderAvailabilityReceipt(
+                classification=ProviderBlockerClassification.QUOTA_EXHAUSTED,
+                retries_used=2,
+                waited_seconds=30,
+            )
+        )
+    )
+
+    assert result.outcome == Outcome.BLOCKED
+    assert result.blocker is not None
+    assert result.blocker.category == "service_unavailable"
+    assert result.blocker_verified is True
+    assert result.provider_availability is not None
+    assert result.provider_availability.classification == "quota_exhausted"
+    persisted = result.model_dump_json()
+    assert "provider.invalid" not in persisted
+    assert "OPENAI_API_KEY" not in persisted
+    assert "response body" not in persisted
+
+
 def test_discussion_context_ignores_workpad_and_sanitizes_public_input() -> None:
     workpad_comment = IssueComment(
         database_id=1,
@@ -1081,6 +1112,9 @@ class _FakeWorkspaceManager:
             allow_existing=True,
         )
 
+    def discard_unpublished_attempt(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
 class _PendingWorkspaceManager:
     def __init__(self, root: Path, branch: str) -> None:
@@ -1127,6 +1161,78 @@ def _metadata() -> ProjectMetadata:
         project_id="project",
         status_field_id="status",
         status_options={},
+    )
+
+
+async def test_explicit_provider_quota_blocks_once_before_later_model_operations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_target_config(tmp_path)
+    config = HaloConfig.load(tmp_path)
+    issue = _issue(config)
+    state = HaloState(
+        issue_repository=config.repository,
+        issue_number=issue.number,
+        run_id="halo-20-provider-blocked",
+        phase="research",
+        workspace_branch="halo/issue-20-improve-eve-tracing",
+        base_revision="a" * 40,
+    )
+    entry = next_entry(state, None, producer="halo-bot")
+    github = _FakeGitHub(
+        [
+            IssueComment(
+                database_id=100,
+                author="halo-bot",
+                body=render_entry(entry, "Research started."),
+                created_at="2026-07-31T00:00:00Z",
+            )
+        ]
+    )
+    manager = _FakeWorkspaceManager(tmp_path)
+    investigator = _FakeInvestigator()
+
+    class QuotaEngine:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def analyze(self, **_kwargs: object) -> None:
+            self.calls += 1
+            request = httpx.Request("POST", "https://provider.invalid/v1/responses")
+            raise APIStatusError(
+                "secret provider response body",
+                response=httpx.Response(429, request=request),
+                body={"error": {"code": "insufficient_quota", "message": "secret"}},
+            )
+
+    engine = QuotaEngine()
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    monkeypatch.setattr("shea_halo.service.WorkspaceManager", lambda _config: manager)
+
+    await HaloService(
+        [config],
+        investigator=cast(Investigator, investigator),
+        halo_engine=cast(HaloEngineAdapter, engine),
+    )._process(config, cast(GitHubClient, github), _metadata(), issue)
+
+    head = find_head(
+        github.comments,
+        repository=config.repository,
+        issue_number=issue.number,
+        trusted_producers={"halo-bot"},
+    )
+    assert engine.calls == 1
+    assert investigator.calls == 0
+    assert github.statuses == ["Need Human Input"]
+    assert head is not None and head.entry.state.result is not None
+    assert head.entry.state.result.provider_availability is not None
+    assert head.entry.state.result.provider_availability.classification == "quota_exhausted"
+    assert "provider.invalid" not in head.entry.state.result.model_dump_json()
+    assert "secret" not in head.entry.state.result.model_dump_json()
+    assert all(
+        "provider.invalid" not in comment.body and "secret" not in comment.body
+        for comment in github.comments
     )
 
 
@@ -1731,7 +1837,7 @@ async def test_research_status_supersedes_a_stale_pending_transition(
     assert head.entry.state.status_transition is None
 
 
-async def test_explicit_move_back_to_halo_research_reenters_finalized_workpad(
+async def test_explicit_move_back_to_halo_research_retries_after_provider_recovery(
     tmp_path: Path, monkeypatch: object
 ) -> None:
     write_target_config(tmp_path)
@@ -1740,12 +1846,17 @@ async def test_explicit_move_back_to_halo_research_reenters_finalized_workpad(
         issue_repository=config.repository,
         issue_number=20,
         run_id="halo-20-original",
-        phase="ready",
+        phase="blocked",
         workspace_branch="halo/issue-20-improve-eve-tracing",
         base_revision="a" * 40,
-        result=InvestigationResult(
-            outcome=Outcome.READY_FOR_TODO,
-            summary="Previously ready.",
+        result=_provider_availability_blocker(
+            ProviderAvailabilityBlockedError(
+                ProviderAvailabilityReceipt(
+                    classification=ProviderBlockerClassification.QUOTA_EXHAUSTED,
+                    retries_used=0,
+                    waited_seconds=0,
+                )
+            )
         ),
     )
     prior_entry = next_entry(prior_state, None, producer="halo-bot")
@@ -1754,7 +1865,7 @@ async def test_explicit_move_back_to_halo_research_reenters_finalized_workpad(
             IssueComment(
                 database_id=100,
                 author="halo-bot",
-                body=render_entry(prior_entry, "Previously ready."),
+                body=render_entry(prior_entry, "Provider was unavailable."),
                 created_at="2026-07-24T00:00:00Z",
             )
         ]

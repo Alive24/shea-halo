@@ -37,7 +37,7 @@ from shea_halo.models import (
     Verification,
 )
 from shea_halo.observation import TraceObservation, TraceValidation
-from shea_halo.provider import OpenAIModelBootstrap
+from shea_halo.provider import OpenAIModelBootstrap, ProviderAvailabilityPolicy
 from shea_halo.security import (
     is_sensitive_path,
     redact_text,
@@ -267,9 +267,11 @@ class Investigator:
         validation_actions: list[ExecutedAction],
         verification: list[Verification],
         source_clean: bool,
+        provider_policy: ProviderAvailabilityPolicy | None = None,
     ) -> AgentDecision:
         """Re-decide the handoff from immutable candidate evidence without tools."""
 
+        provider_policy = provider_policy or ProviderAvailabilityPolicy()
         prompt = candidate_synthesis_prompt(
             config=config,
             issue_number=issue_number,
@@ -309,11 +311,13 @@ class Investigator:
             decision: AgentDecision | None = None
             for attempt in range(2):
                 try:
-                    result = await Runner.run(
-                        agent,
-                        prompt,
-                        max_turns=3,
-                        run_config=model_bootstrap.run_config(),
+                    result = await provider_policy.run(
+                        lambda: Runner.run(
+                            agent,
+                            prompt,
+                            max_turns=3,
+                            run_config=model_bootstrap.run_config(),
+                        )
                     )
                 except Exception as exc:
                     model_bootstrap.reraise_if_unsupported(exc)
@@ -373,7 +377,9 @@ class Investigator:
         issue_discussion: str,
         prior_result: InvestigationResult | None,
         halo_analysis: HaloAnalysisArtifact | None,
+        provider_policy: ProviderAvailabilityPolicy | None = None,
     ) -> InvestigationResult:
+        provider_policy = provider_policy or ProviderAvailabilityPolicy()
         catalog = IntegrationCatalog(config.artifacts_dir / "integration-catalog")
         guides = catalog.load()
         dependencies = discover_dependencies(workspace.path)
@@ -657,12 +663,14 @@ class Investigator:
             span.set_attribute("shea.issue.number", issue_number)
             span.set_attribute("shea.halo.run_id", run_id)
             try:
-                result = await Runner.run(
-                    agent,
-                    prompt,
-                    max_turns=config.investigator_max_turns,
-                    run_config=model_bootstrap.run_config(),
-                    error_handlers={"max_turns": checkpoint_at_turn_limit},
+                result = await provider_policy.run(
+                    lambda: Runner.run(
+                        agent,
+                        prompt,
+                        max_turns=config.investigator_max_turns,
+                        run_config=model_bootstrap.run_config(),
+                        error_handlers={"max_turns": checkpoint_at_turn_limit},
+                    )
                 )
             except Exception as exc:
                 model_bootstrap.reraise_if_unsupported(exc)
