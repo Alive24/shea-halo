@@ -139,8 +139,7 @@ def _explicit_quota_code(error: APIStatusError) -> bool:
         if isinstance(nested, Mapping):
             values.append(nested.get("code"))
     return any(
-        isinstance(value, str) and value.casefold() in _EXPLICIT_QUOTA_CODES
-        for value in values
+        isinstance(value, str) and value.casefold() in _EXPLICIT_QUOTA_CODES for value in values
     )
 
 

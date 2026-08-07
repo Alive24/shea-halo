@@ -54,8 +54,8 @@ from shea_halo.runtime_fs import RuntimeFilesystemError
 from shea_halo.service import (
     HaloService,
     ServiceError,
-    _provider_availability_blocker,
     _provider_api_mode_blocker,
+    _provider_availability_blocker,
     _runtime_source_sha256,
 )
 from shea_halo.tracing import ResearchTracing
