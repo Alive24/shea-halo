@@ -49,7 +49,7 @@ from shea_halo.provider import (
     ProviderAvailabilityPolicy,
     ProviderBlockerClassification,
 )
-from shea_halo.runtime_fs import append_runtime_text
+from shea_halo.runtime_fs import RuntimeFilesystemError, append_runtime_text
 from shea_halo.security import sanitize_persisted_data, sanitize_persisted_text
 from shea_halo.tracing import ResearchTracing
 from shea_halo.workpad import (
@@ -348,6 +348,7 @@ class HaloService:
                 workspace_branch=workspace_branch,
             )
             head = self._append(
+                config,
                 github,
                 issue,
                 head,
@@ -389,6 +390,7 @@ class HaloService:
                 branch=head.entry.state.branch,
             )
             head = self._append(
+                config,
                 github,
                 issue,
                 head,
@@ -446,6 +448,7 @@ class HaloService:
                 result=pending_result,
             )
             head = self._append(
+                config,
                 github,
                 issue,
                 head,
@@ -489,6 +492,7 @@ class HaloService:
                 update={"updated_at": datetime.now(UTC)}
             )
             head = self._append(
+                config,
                 github,
                 issue,
                 head,
@@ -655,6 +659,7 @@ class HaloService:
             input_fingerprint=input_fingerprint,
         )
         head = self._append(
+            config,
             github,
             issue,
             head,
@@ -799,6 +804,7 @@ class HaloService:
                 result=result,
             )
             self._append_result(
+                config,
                 github,
                 issue,
                 head,
@@ -849,6 +855,7 @@ class HaloService:
                 result=result,
             )
             head = self._append(
+                config,
                 github,
                 issue,
                 head,
@@ -888,6 +895,7 @@ class HaloService:
         )
         github.assert_branch_has_no_pull_requests(issue.repository, workspace_branch)
         head = self._append(
+            config,
             github,
             issue,
             head,
@@ -951,6 +959,7 @@ class HaloService:
         if transition.target != issue.status:
             superseded = head.entry.state.model_copy(update={"status_transition": None})
             self._append(
+                config,
                 github,
                 issue,
                 head,
@@ -983,6 +992,7 @@ class HaloService:
             }
         )
         self._append(
+            config,
             github,
             issue,
             head,
@@ -1169,6 +1179,7 @@ class HaloService:
                 result=failed,
             )
             self._append_result(
+                config,
                 github,
                 issue,
                 head,
@@ -1482,6 +1493,7 @@ class HaloService:
                 desktop_preflight=preliminary_result.desktop_preflight,
             )
             self._append_result(
+                config,
                 github,
                 issue,
                 head,
@@ -1709,27 +1721,28 @@ class HaloService:
             }
         )
         github.assert_issue_remains_in_research(issue)
-        entry, body = self._prepare_append(head, producer, routed, summary)
-        self.tracing.attach_result(state.result)
-        with self.tracing.stage(
-            "project-routing",
-            attributes={
-                "shea.project.routing.terminal": target_status is not None,
-                "shea.project.routing.target": target_status or "Halo Research",
-            },
-        ):
-            pass
-        # Canonical evidence is authoritative and must be durable before a
-        # Workpad publication or Project mutation can promote this result.
-        self.tracing.finalize_run(state.result.outcome.value)
-        github.assert_issue_remains_in_research(issue)
-        head = self._persist_prepared(
-            github,
-            issue,
-            producer,
-            entry,
-            body,
-        )
+        if not self._suppress_unchanged_checkpoint(config, issue, head, routed):
+            entry, body = self._prepare_append(head, producer, routed, summary)
+            self.tracing.attach_result(state.result)
+            with self.tracing.stage(
+                "project-routing",
+                attributes={
+                    "shea.project.routing.terminal": target_status is not None,
+                    "shea.project.routing.target": target_status or "Halo Research",
+                },
+            ):
+                pass
+            # Canonical evidence is authoritative and must be durable before a
+            # Workpad publication or Project mutation can promote this result.
+            self.tracing.finalize_run(state.result.outcome.value)
+            github.assert_issue_remains_in_research(issue)
+            head = self._persist_prepared(
+                github,
+                issue,
+                producer,
+                entry,
+                body,
+            )
         if target_status is None:
             return head
 
@@ -1748,6 +1761,7 @@ class HaloService:
             }
         )
         return self._append(
+            config,
             github,
             issue,
             head,
@@ -1783,9 +1797,9 @@ class HaloService:
             raise ServiceError("GitHub persisted the Halo workpad under an unexpected author")
         return WorkpadHead(comment_id=comment.database_id, entry=entry)
 
-    @classmethod
     def _append(
-        cls,
+        self,
+        config: HaloConfig,
         github: GitHubClient,
         issue: ProjectIssue,
         head: WorkpadHead | None,
@@ -1797,11 +1811,16 @@ class HaloService:
     ) -> WorkpadHead:
         if require_research:
             github.assert_issue_remains_in_research(issue)
-        entry, body = cls._prepare_append(head, producer, state, summary)
-        return cls._persist_prepared(github, issue, producer, entry, body)
+        if self._suppress_unchanged_checkpoint(config, issue, head, state):
+            if head is None:  # pragma: no cover - guarded by the helper
+                raise ServiceError("initial Halo claim cannot be suppressed")
+            return head
+        entry, body = self._prepare_append(head, producer, state, summary)
+        return self._persist_prepared(github, issue, producer, entry, body)
 
     def _append_result(
         self,
+        config: HaloConfig,
         github: GitHubClient,
         issue: ProjectIssue,
         head: WorkpadHead,
@@ -1812,11 +1831,53 @@ class HaloService:
         if state.result is None:
             raise ServiceError("a completed research append requires an investigation result")
         github.assert_issue_remains_in_research(issue)
+        if self._suppress_unchanged_checkpoint(config, issue, head, state):
+            return head
         entry, body = self._prepare_append(head, producer, state, summary)
         self.tracing.attach_result(state.result)
         self.tracing.finalize_run(state.result.outcome.value)
         github.assert_issue_remains_in_research(issue)
         return self._persist_prepared(github, issue, producer, entry, body)
+
+    def _suppress_unchanged_checkpoint(
+        self,
+        config: HaloConfig,
+        issue: ProjectIssue,
+        head: WorkpadHead | None,
+        state: HaloState,
+    ) -> bool:
+        """Log and suppress only a provably identical typed checkpoint."""
+
+        if head is None:
+            return False
+        try:
+            previous_identity = head.entry.state.persistence_identity()
+            proposed_identity = state.persistence_identity()
+            if previous_identity != proposed_identity:
+                return False
+            persistence_sha256 = proposed_identity.digest()
+        except (TypeError, ValueError):
+            # An identity contract that cannot be constructed or serialized is
+            # ambiguous. Preserve the append-only checkpoint instead.
+            return False
+
+        try:
+            self._log(
+                config,
+                issue,
+                "workpad_checkpoint_suppressed",
+                {
+                    "run_id": state.run_id,
+                    "phase": state.phase,
+                    "reason": "semantic_identity_unchanged",
+                    "persistence_sha256": persistence_sha256,
+                },
+            )
+        except (OSError, TypeError, ValueError, RuntimeFilesystemError):
+            # Suppression evidence is part of the no-op contract. If the
+            # managed local log is unavailable, retain the durable checkpoint.
+            return False
+        return True
 
     @staticmethod
     def _gate_outcome(
