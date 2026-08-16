@@ -1,0 +1,4 @@
+interface:
+  display_name: "Shea Halo Manual Review"
+  short_description: "Trigger one external Shea Halo review"
+  default_prompt: "Use $shea-symphony-manual-review to trigger the configured external review for one named Shea Halo issue and read back its result."

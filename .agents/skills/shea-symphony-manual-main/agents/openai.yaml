@@ -1,0 +1,4 @@
+interface:
+  display_name: "Shea Halo Manual Main"
+  short_description: "Execute one Shea Halo Main issue end to end"
+  default_prompt: "Use $shea-symphony-manual-main to implement one operator-selected Shea Halo issue in this task and stop at Agent Review."
