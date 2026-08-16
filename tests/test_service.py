@@ -30,6 +30,7 @@ from shea_halo.models import (
     HaloDesktopPreflightReceipt,
     HaloDesktopPreflightResult,
     HaloState,
+    HaloStatePersistenceIdentity,
     InvestigationResult,
     Outcome,
     PublicationIntent,
@@ -249,6 +250,177 @@ def test_halo_state_rejects_incoherent_lifecycle_payloads() -> None:
                 applied_at=datetime.now(UTC),
             ),
         )
+
+
+def test_halo_state_persistence_identity_excludes_only_updated_at() -> None:
+    original = HaloState(
+        issue_repository="Alive24/FailureReport",
+        issue_number=26,
+        run_id="halo-26-persistence",
+        phase="research",
+        workspace_branch="halo/issue-26-tracing",
+        updated_at=datetime(2026, 8, 16, 10, tzinfo=UTC),
+    )
+    timestamp_only = original.model_copy(
+        update={"updated_at": datetime(2026, 8, 16, 11, tzinfo=UTC)}
+    )
+
+    assert original.persistence_identity() == timestamp_only.persistence_identity()
+    assert (
+        original.persistence_identity().digest() == timestamp_only.persistence_identity().digest()
+    )
+    assert set(HaloState.model_fields) - {"updated_at"} == set(
+        HaloStatePersistenceIdentity.model_fields
+    ) - {"schema_version"}
+
+
+def test_halo_state_persistence_identity_retains_nested_receipt_timestamps() -> None:
+    first = HaloState(
+        issue_repository="Alive24/FailureReport",
+        issue_number=26,
+        run_id="halo-26-persistence",
+        phase="ready",
+        workspace_branch="halo/issue-26-tracing",
+        base_revision="a" * 40,
+        result=_ready_result(),
+        status_transition=StatusTransition(
+            target="Todo",
+            state="pending",
+            created_at=datetime(2026, 8, 16, 10, tzinfo=UTC),
+        ),
+    )
+    later_intent = first.model_copy(
+        update={
+            "status_transition": first.status_transition.model_copy(
+                update={"created_at": datetime(2026, 8, 16, 11, tzinfo=UTC)}
+            )
+            if first.status_transition is not None
+            else None
+        }
+    )
+
+    assert first.persistence_identity() != later_intent.persistence_identity()
+
+
+def test_halo_state_persistence_identity_tracks_recovery_authority() -> None:
+    common = {
+        "issue_repository": "Alive24/FailureReport",
+        "issue_number": 26,
+        "run_id": "halo-26-authority",
+        "workspace_branch": "halo/issue-26-tracing",
+    }
+    continuing = InvestigationResult(
+        outcome=Outcome.CONTINUE_RESEARCH,
+        summary="Continue with the recorded evidence.",
+    )
+    checkpoint = ObservationCheckpoint(
+        desktop_reports=(
+            FileObservation(
+                label="target/.shea/artifacts/halo/desktop/run/report.md",
+                sha256="d" * 64,
+                size_bytes=10,
+            ),
+        )
+    )
+    created_at = datetime(2026, 8, 16, 10, tzinfo=UTC)
+
+    base = HaloState(**common, phase="research", base_revision="a" * 40)
+    branch = HaloState(
+        **common,
+        phase="research",
+        base_revision="a" * 40,
+        branch=BranchSnapshot(name=common["workspace_branch"], head_revision="b" * 40),
+    )
+    publishing = HaloState(
+        **common,
+        phase="experimenting",
+        base_revision="a" * 40,
+        publication_intent=PublicationIntent(
+            branch=common["workspace_branch"],
+            parent_revision="a" * 40,
+            manifest_sha256="b" * 64,
+            paths=[
+                SnapshotPath(
+                    path="instrumentation.ts",
+                    state="file",
+                    sha256="c" * 64,
+                    size=1,
+                )
+            ],
+            created_at=created_at,
+        ),
+        result=continuing,
+    )
+    validating = HaloState(
+        **common,
+        phase="validating",
+        base_revision="a" * 40,
+        validation_baseline=checkpoint,
+        result=continuing,
+    )
+    changed_result = HaloState(
+        **common,
+        phase="research",
+        result=continuing.model_copy(update={"summary": "Materially changed result."}),
+    )
+    blocked = HaloState(
+        **common,
+        phase="blocked",
+        result=InvestigationResult(
+            outcome=Outcome.BLOCKED,
+            summary="External input is required.",
+            blocker=ExternalBlocker(
+                category="missing_input",
+                description="The required fixture is unavailable.",
+                required_action="Provide the fixture.",
+            ),
+            blocker_verified=True,
+        ),
+    )
+    pending = HaloState(
+        **common,
+        phase="ready",
+        result=_ready_result(),
+        status_transition=StatusTransition(target="Todo", state="pending", created_at=created_at),
+    )
+    applied = pending.model_copy(
+        update={
+            "status_transition": StatusTransition(
+                target="Todo",
+                state="applied",
+                created_at=created_at,
+                applied_at=datetime(2026, 8, 16, 11, tzinfo=UTC),
+            )
+        }
+    )
+
+    comparisons = (
+        (base, base.model_copy(update={"base_revision": "b" * 40})),
+        (base, branch),
+        (
+            publishing,
+            publishing.model_copy(
+                update={
+                    "publication_intent": publishing.publication_intent.model_copy(
+                        update={"manifest_sha256": "e" * 64}
+                    )
+                    if publishing.publication_intent is not None
+                    else None
+                }
+            ),
+        ),
+        (
+            validating,
+            validating.model_copy(update={"validation_baseline": ObservationCheckpoint()}),
+        ),
+        (HaloState(**common, phase="research", result=continuing), changed_result),
+        (HaloState(**common, phase="research", result=continuing), blocked),
+        (pending, applied),
+    )
+
+    for previous, proposed in comparisons:
+        assert previous.persistence_identity() != proposed.persistence_identity()
+        assert previous.persistence_identity().digest() != proposed.persistence_identity().digest()
 
 
 def test_ready_gate_rejects_incomplete_or_stale_evidence() -> None:
@@ -1055,6 +1227,139 @@ class _FakeGitHub:
         return issue
 
 
+def test_fifty_semantically_unchanged_append_proposals_retain_one_head(
+    tmp_path: Path,
+) -> None:
+    write_target_config(tmp_path)
+    config = HaloConfig.load(tmp_path)
+    issue = _issue(config)
+    initial_state = HaloState(
+        issue_repository=config.repository,
+        issue_number=issue.number,
+        run_id="halo-20-no-op",
+        phase="research",
+        workspace_branch="halo/issue-20-improve-eve-tracing",
+        updated_at=datetime(2026, 8, 16, 10, tzinfo=UTC),
+    )
+    initial_entry = next_entry(initial_state, None, producer="halo-bot")
+    github = _FakeGitHub(
+        [
+            IssueComment(
+                database_id=100,
+                author="halo-bot",
+                body=render_entry(initial_entry, "Claimed."),
+                created_at="2026-08-16T10:00:00Z",
+            )
+        ]
+    )
+    service = HaloService([config])
+    head = WorkpadHead(comment_id=100, entry=initial_entry)
+
+    for second in range(50):
+        proposed = initial_state.model_copy(
+            update={"updated_at": datetime(2026, 8, 16, 11, 0, second, tzinfo=UTC)}
+        )
+        returned = service._append(
+            config,
+            cast(GitHubClient, github),
+            issue,
+            head,
+            "halo-bot",
+            proposed,
+            "A visible summary difference with sk-abcdefghijklmnopqrstuvwxyz is not state.",
+        )
+        assert returned is head
+
+    assert len(github.comments) == 1
+    assert "add_comment" not in github.events
+    rendered_log = (config.logs_dir / "worker.jsonl").read_text(encoding="utf-8")
+    records = [json.loads(line) for line in rendered_log.splitlines()]
+    assert len(records) == 50
+    assert {record["event"] for record in records} == {"workpad_checkpoint_suppressed"}
+    assert {record["reason"] for record in records} == {"semantic_identity_unchanged"}
+    assert {record["run_id"] for record in records} == {initial_state.run_id}
+    assert {record["phase"] for record in records} == {initial_state.phase}
+    assert all(len(record["persistence_sha256"]) == 64 for record in records)
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in rendered_log
+    assert str(tmp_path) not in rendered_log
+
+
+def test_unavailable_persistence_identity_fails_safe_by_appending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_target_config(tmp_path)
+    config = HaloConfig.load(tmp_path)
+    issue = _issue(config)
+    initial_state = HaloState(
+        issue_repository=config.repository,
+        issue_number=issue.number,
+        run_id="halo-20-identity-unavailable",
+        phase="research",
+        workspace_branch="halo/issue-20-improve-eve-tracing",
+    )
+    initial_entry = next_entry(initial_state, None, producer="halo-bot")
+    github = _FakeGitHub([])
+    head = WorkpadHead(comment_id=100, entry=initial_entry)
+
+    def unavailable(_state: HaloState) -> HaloStatePersistenceIdentity:
+        raise ValueError("identity version unavailable")
+
+    monkeypatch.setattr(HaloState, "persistence_identity", unavailable)
+
+    returned = HaloService([config])._append(
+        config,
+        cast(GitHubClient, github),
+        issue,
+        head,
+        "halo-bot",
+        initial_state,
+        "Retained because comparison was unavailable.",
+    )
+
+    assert returned.entry.revision == 2
+    assert github.events.count("add_comment") == 1
+
+
+def test_unavailable_suppression_log_fails_safe_by_appending(tmp_path: Path) -> None:
+    write_target_config(tmp_path)
+    config = HaloConfig.load(tmp_path)
+    issue = _issue(config)
+    initial_state = HaloState(
+        issue_repository=config.repository,
+        issue_number=issue.number,
+        run_id="halo-20-log-unavailable",
+        phase="research",
+        workspace_branch="halo/issue-20-improve-eve-tracing",
+    )
+    initial_entry = next_entry(initial_state, None, producer="halo-bot")
+    initial_comment = IssueComment(
+        database_id=100,
+        author="halo-bot",
+        body=render_entry(initial_entry, "Claimed."),
+        created_at="2026-08-16T10:00:00Z",
+    )
+    github = _FakeGitHub([initial_comment])
+    config.logs_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("protected\n", encoding="utf-8")
+    (config.logs_dir / "worker.jsonl").hardlink_to(outside)
+
+    returned = HaloService([config])._append(
+        config,
+        cast(GitHubClient, github),
+        issue,
+        WorkpadHead(comment_id=100, entry=initial_entry),
+        "halo-bot",
+        initial_state,
+        "Retained because the local suppression receipt was unavailable.",
+    )
+
+    assert returned.entry.revision == 2
+    assert github.events.count("add_comment") == 1
+    assert outside.read_text(encoding="utf-8") == "protected\n"
+
+
 class _FakeWorkspaceManager:
     def __init__(self, root: Path, *, current_base_revision: str = "a" * 40) -> None:
         self.root = root
@@ -1533,6 +1838,7 @@ def test_completed_result_finalizes_trace_before_workpad_publication(
 
     with pytest.raises(RuntimeError, match="comment unavailable"):
         service._append_result(
+            config,
             cast(GitHubClient, github),
             issue,
             WorkpadHead(comment_id=100, entry=initial_entry),

@@ -46,6 +46,8 @@ On re-entry, Halo reads the prior trusted workpad result plus ordinary Issue dis
 
 Terminal routing is also append-only. Halo records a pending status transition, changes the Project field, then records the applied transition. If the status write succeeds but the second comment fails, the worker scans every status for Issues in the configured target repository on its next pass. It either completes that workpad record or records that a later downstream status such as `In Progress` superseded the pending Halo transition; it never moves the item backward.
 
+Durable workpad checkpoints are reserved for typed lifecycle changes. If a proposed `HaloState` differs from the trusted head only in its non-authoritative `updated_at` value, Halo keeps the existing comment and revision and writes a bounded `workpad_checkpoint_suppressed` receipt to the target-local `.shea/logs/halo/worker.jsonl`. The receipt contains issue/run/phase correlation, a fixed reason, and a digest—not state, summaries, prompts, payloads, endpoints, credentials, exceptions, or host paths. Every base, workspace, snapshot, publication intent, observation baseline, result, blocker, and pending/applied transition change remains append-only durable state. If typed comparison or local receipt persistence is unavailable, Halo fails safe by retaining the GitHub checkpoint.
+
 ## Experimental branches
 
 Halo owns `.shea/worktrees/halo/` and may publish `halo/issue-<number>-<stable-semantic-slug>`.

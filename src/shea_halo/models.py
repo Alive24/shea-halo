@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Literal, TypeAlias
@@ -315,6 +317,47 @@ class HaloState(StrictModel):
         ):
             raise ValueError("terminal Halo phase does not match its investigation outcome")
         return self
+
+    def persistence_identity(self) -> HaloStatePersistenceIdentity:
+        """Return the typed recovery identity used to decide durable appends.
+
+        ``updated_at`` is deliberately the only excluded state field. Nested
+        timestamps belong to evidence and write-ahead receipts, so they remain
+        authoritative. Validation through the strict identity model makes a
+        future ``HaloState`` field fail closed until this contract is updated.
+        """
+
+        return HaloStatePersistenceIdentity.model_validate(self.model_dump(exclude={"updated_at"}))
+
+
+class HaloStatePersistenceIdentity(StrictModel):
+    """Versioned semantic identity for one durable Halo lifecycle checkpoint."""
+
+    schema_version: Literal["shea-halo/persistence-v1"] = "shea-halo/persistence-v1"
+    issue_repository: str
+    issue_number: int
+    run_id: str
+    phase: Phase
+    api_mode: ApiMode = "responses"
+    workspace_branch: str
+    base_revision: str | None = None
+    branch: BranchSnapshot | None = None
+    publication_intent: PublicationIntent | None = None
+    validation_baseline: ObservationCheckpoint | None = None
+    status_transition: StatusTransition | None = None
+    input_fingerprint: str | None = Field(default=None, min_length=64, max_length=64)
+    result: InvestigationResult | None = None
+
+    def digest(self) -> str:
+        """Return a deterministic, non-reversible receipt for local telemetry."""
+
+        canonical = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
 
 
 class WorkpadEntry(StrictModel):
