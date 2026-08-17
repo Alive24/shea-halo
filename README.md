@@ -155,7 +155,9 @@ HALO Engine artifacts are local and ignored under `.shea/artifacts/halo/<run-id>
 - `analysis.json` — a versioned manifest with logical trace labels, digests, and run provenance;
 - `events.jsonl` — bounded, sanitized event summaries;
 - `report.md` — the sanitized HALO report;
-- `halo-telemetry.jsonl` — a sanitized local copy of HALO's own telemetry.
+- `halo-telemetry.jsonl` — a sanitized local projection of HALO's telemetry that omits raw
+  prompts, input/output messages, tool payloads, and invocation parameters such as provider
+  routes.
 
 ## Research trace bundles
 

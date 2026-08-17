@@ -175,6 +175,20 @@ _PERSISTED_OUTPUTS = (
     "halo-telemetry.jsonl",
     ".halo-telemetry.jsonl.tmp",
 )
+_OMITTED_HALO_TELEMETRY_ATTRIBUTE_PREFIXES = (
+    "input.value",
+    "llm.input_messages",
+    "llm.invocation_parameters",
+    "llm.output_messages",
+    "output.value",
+)
+
+
+def _keep_halo_telemetry_attribute(name: str) -> bool:
+    return not any(
+        name == prefix or name.startswith(f"{prefix}.")
+        for prefix in _OMITTED_HALO_TELEMETRY_ATTRIBUTE_PREFIXES
+    )
 
 
 def _trace_index_process_pool_available() -> bool:
@@ -512,6 +526,15 @@ def _persist_safe_jsonl(
                 except json.JSONDecodeError:
                     rendered = _safe_text(raw_line.rstrip("\n"), path_labels=path_labels)
                 else:
+                    if isinstance(payload, dict) and isinstance(payload.get("attributes"), dict):
+                        payload = {
+                            **payload,
+                            "attributes": {
+                                key: value
+                                for key, value in payload["attributes"].items()
+                                if _keep_halo_telemetry_attribute(key)
+                            },
+                        }
                     rendered = json.dumps(
                         _safe_data(payload, path_labels=path_labels),
                         ensure_ascii=False,

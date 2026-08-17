@@ -703,6 +703,7 @@ async def test_analysis_persists_only_sanitized_logical_artifacts(
     trace_path.parent.mkdir(parents=True)
     trace_path.write_text(json.dumps(canonical_span()) + "\n", encoding="utf-8")
     secret = "sk-halo-artifact-secret-value"
+    provider_endpoint = "https://provider.example/v1"
     monkeypatch.setenv("OPENAI_API_KEY", secret)
     stale_run_dir = artifacts_dir / "run-26" / "halo-engine"
     (stale_run_dir / "indexes").mkdir(parents=True)
@@ -728,6 +729,23 @@ async def test_analysis_persists_only_sanitized_logical_artifacts(
                 {
                     "api_key": secret,
                     "source": str(workspace_path / "src/agent.py"),
+                    "attributes": {
+                        "input.value": "private raw input",
+                        "llm.invocation_parameters": json.dumps(
+                            {
+                                "base_url": provider_endpoint,
+                                "messages": [{"role": "user", "content": "private prompt"}],
+                            }
+                        ),
+                        "llm.input_messages": "private input messages",
+                        "llm.input_messages.0.message.content": "private prompt",
+                        "llm.input_messages.1.message.tool_calls.0.tool_call.function.arguments": (
+                            "private tool arguments"
+                        ),
+                        "llm.model_name": "gpt-test",
+                        "llm.output_messages": "private output messages",
+                        "output.value": "private raw output",
+                    },
                 }
             )
             + "\n",
@@ -802,6 +820,19 @@ async def test_analysis_persists_only_sanitized_logical_artifacts(
     assert str(root) not in persisted
     assert str(workspace_path) not in persisted
     assert raw_paths["telemetry"] not in persisted
+    assert provider_endpoint not in persisted
+    for forbidden in (
+        "private input messages",
+        "private output messages",
+        "private prompt",
+        "private raw input",
+        "private raw output",
+        "private tool arguments",
+        "llm.input_messages",
+        "llm.invocation_parameters",
+        "llm.output_messages",
+    ):
+        assert forbidden not in persisted
     assert "<workspace>/src/agent.py" in report
     assert "<engine-temporary>/halo-telemetry.jsonl" in report
     assert manifest["dataset"]["files"][0]["path"].startswith("workspace:")
@@ -823,7 +854,9 @@ async def test_analysis_persists_only_sanitized_logical_artifacts(
         "sequence",
     }
     assert event["content_summary"] == report
-    assert json.loads(telemetry)["api_key"] == "[REDACTED]"
+    telemetry_payload = json.loads(telemetry)
+    assert telemetry_payload["api_key"] == "[REDACTED]"
+    assert telemetry_payload["attributes"] == {"llm.model_name": "gpt-test"}
     assert not (run_dir / "indexes").exists()
 
 
