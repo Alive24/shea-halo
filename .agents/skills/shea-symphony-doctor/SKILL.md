@@ -27,7 +27,7 @@ For each finding, state:
 End with one concrete next step, not a vague route:
 
 - a named lane handoff, such as $shea-symphony-manual-main,
-  $shea-symphony-manual-review, or $shea-symphony-manual-merge;
+  $shea-agent-review, or $shea-symphony-manual-merge;
 - the configured foreground workflow action;
 - a documented state, PR-link, worktree, or install-health repair; or
 - one focused operator question.

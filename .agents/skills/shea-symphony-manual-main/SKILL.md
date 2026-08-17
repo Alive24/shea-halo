@@ -26,7 +26,7 @@ Own only:
 Do not shape or promote an ordinary Backlog item, perform independent review,
 approve Human-owned UAT, set `Human Review`, enter `Merging`, or merge a PR.
 Use `$shea-symphony-issue-forge` for normal Backlog promotion and
-`$shea-symphony-manual-review` after Main handoff.
+`$shea-agent-review` after Main handoff.
 
 ## Bind the Repository
 
