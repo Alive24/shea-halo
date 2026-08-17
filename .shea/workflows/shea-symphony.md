@@ -42,6 +42,12 @@ prompts:
   main_agent: ../prompts/main-agent.md
   review_agent: ../prompts/review-agent.md
   merge_agent: ../prompts/merge-agent.md
+backend_prompts:
+  codex_app_server: ../prompts/backend/codex-app-server.md
+  automatic_review: ../prompts/backend/automatic-review.md
+  automatic_review_structured: ../prompts/backend/automatic-review-structured.md
+  claude_code_review: ../prompts/backend/claude-code-review.md
+  merge_repair: ../prompts/backend/merge-repair.md
 workpad_templates:
   agent_review_run: ../template/workpad/agent-review.md
   doctor_triage: ../template/workpad/doctor-triage.md

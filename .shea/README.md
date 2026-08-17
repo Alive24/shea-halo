@@ -6,10 +6,23 @@ Tracked configuration:
 
 - app-profile.json selects the shared workflow.
 - workflows/shea-symphony.md contains the GitHub Project #11 and lane runtime configuration.
-- prompts/ contains the separate Main, Review, and Merge lane contracts.
+- prompts/ contains the separate Main, Review, and Merge lane contracts plus
+  workflow-selected backend boundaries.
+- contracts/ defines the target-neutral workflow capability and the checked-in
+  Legacy CLI adapter used by repository skills.
 - template/ contains the shared append-only timeline and workpad rendering contracts.
 
-`workflows/`, `prompts/`, and `template/` are Shea Halo-owned integration contracts and may be tailored to this Python repository. `.shea/app/` and `.shea/bin/` are copied unchanged from the vendored Shea Symphony 2606 MVP runtime; do not patch them when changing Shea Halo's tracker policy or lane instructions.
+`workflows/`, `prompts/`, `contracts/`, and `template/` are Shea Halo-owned
+integration contracts and may be tailored to this Python repository.
+`.shea/app/` remains the vendored Shea Symphony 2606 MVP app. The checked-in
+`.shea/bin/shea-symphony` compatibility CLI is refreshed only from a verified
+locked release artifact when its runtime contract changes; do not patch the
+binary directly for tracker policy or lane prose.
+
+The current CLI identifies itself through `--runtime-info` as `legacy_cli` with
+compatibility `shea-legacy-cli-v1`. Automatic Review behavior is sourced from
+`prompts/backend/`, while result validation, evidence persistence, and routing
+remain code-owned and fail closed on malformed or inconclusive output.
 
 Machine-local files are ignored by the repository root .gitignore:
 
