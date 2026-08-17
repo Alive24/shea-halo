@@ -7,7 +7,20 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import httpx
 import pytest
+from agents import Agent, ModelSettings
+from agents.items import ToolCallItem, ToolCallOutputItem, TResponseInputItem
+from agents.models.interface import ModelTracing
+from agents.stream_events import RunItemStreamEvent
+from engine.agents.agent_context import AgentContext
+from engine.agents.agent_context_items import AgentContextItem
+from engine.agents.agent_execution import AgentExecution
+from engine.agents.openai_event_mapper import OpenAiEventMapper
+from engine.agents.responses_input import to_responses_input
+from engine.model_config import ModelConfig
+from engine.models.messages import AgentMessage, AgentToolCall, AgentToolFunction
+from openai import APIStatusError, AsyncOpenAI
 
 from shea_halo.config import HaloConfig
 from shea_halo.halo_engine import (
@@ -25,6 +38,7 @@ from shea_halo.halo_engine import (
     _trace_index_process_pool_available,
     _write_safe_text,
 )
+from shea_halo.provider import ApiMode, OpenAIModelBootstrap
 from shea_halo.runtime_fs import RuntimeFilesystem
 from shea_halo.workspace import HaloWorkspace
 
@@ -76,6 +90,301 @@ def test_halo_engine_compatibility_boundary_disables_sdk_retries(
 
     assert observed == {"api_key": "test", "max_retries": 0}
     assert engine_main.AsyncOpenAI is client
+
+
+def _tool_call(call_id: str, name: str) -> AgentToolCall:
+    return AgentToolCall(
+        id=call_id,
+        function=AgentToolFunction(name=name, arguments='{"value": 1}'),
+    )
+
+
+def _completed_tool_history() -> list[AgentMessage]:
+    return [
+        AgentMessage(role="user", content="inspect the traces"),
+        AgentMessage(
+            role="assistant",
+            content=None,
+            tool_calls=[
+                _tool_call("call-alpha", "inspect_trace"),
+                _tool_call("call-beta", "inspect_source"),
+            ],
+        ),
+        AgentMessage(
+            role="tool",
+            content="trace receipt",
+            tool_call_id="call-alpha",
+            name="inspect_trace",
+        ),
+        AgentMessage(
+            role="tool",
+            content="source receipt",
+            tool_call_id="call-beta",
+            name="inspect_source",
+        ),
+    ]
+
+
+async def _provider_bound_payload(
+    api_mode: ApiMode,
+    messages: list[AgentMessage],
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[str, dict[str, Any]]:
+    captured: dict[str, Any] = {}
+
+    def reject_after_capture(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(
+            400,
+            request=request,
+            json={
+                "error": {
+                    "message": "deterministic provider shape rejection",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(reject_after_capture))
+    client = AsyncOpenAI(
+        api_key="test-runtime-key",
+        base_url="https://provider.invalid/v1",
+        http_client=http_client,
+        max_retries=0,
+    )
+    client_kwargs: dict[str, object] = {}
+
+    def client_factory(**kwargs: object) -> AsyncOpenAI:
+        client_kwargs.update(kwargs)
+        return client
+
+    monkeypatch.setattr("shea_halo.provider.AsyncOpenAI", client_factory)
+    model = OpenAIModelBootstrap(api_mode).provider().get_model("gpt-test")
+    try:
+        with pytest.raises(APIStatusError, match="deterministic provider shape rejection"):
+            await model.get_response(
+                system_instructions=None,
+                input=cast(list[TResponseInputItem], to_responses_input(messages)),
+                model_settings=ModelSettings(),
+                tools=[],
+                output_schema=None,
+                handoffs=[],
+                tracing=ModelTracing.DISABLED,
+                previous_response_id=None,
+                conversation_id=None,
+                prompt=None,
+            )
+    finally:
+        await client.close()
+
+    assert client_kwargs == {"max_retries": 0}
+    return cast(str, captured["path"]), cast(dict[str, Any], captured["payload"])
+
+
+@pytest.mark.parametrize("api_mode", ["responses", "chat_completions"])
+@pytest.mark.asyncio
+async def test_halo_035_replays_completed_tool_turns_to_both_provider_shapes(
+    api_mode: ApiMode,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, payload = await _provider_bound_payload(
+        api_mode,
+        _completed_tool_history(),
+        monkeypatch,
+    )
+
+    if api_mode == "responses":
+        assert path == "/v1/responses"
+        assert payload["input"] == [
+            {"role": "user", "content": "inspect the traces"},
+            {
+                "type": "function_call",
+                "call_id": "call-alpha",
+                "name": "inspect_trace",
+                "arguments": '{"value": 1}',
+            },
+            {
+                "type": "function_call",
+                "call_id": "call-beta",
+                "name": "inspect_source",
+                "arguments": '{"value": 1}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-alpha",
+                "output": "trace receipt",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-beta",
+                "output": "source receipt",
+            },
+        ]
+    else:
+        assert path == "/v1/chat/completions"
+        assert payload["messages"] == [
+            {"role": "user", "content": "inspect the traces"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-alpha",
+                        "type": "function",
+                        "function": {
+                            "name": "inspect_trace",
+                            "arguments": '{"value": 1}',
+                        },
+                    },
+                    {
+                        "id": "call-beta",
+                        "type": "function",
+                        "function": {
+                            "name": "inspect_source",
+                            "arguments": '{"value": 1}',
+                        },
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-alpha", "content": "trace receipt"},
+            {"role": "tool", "tool_call_id": "call-beta", "content": "source receipt"},
+        ]
+
+
+def _replay_context(items: list[AgentContextItem]) -> AgentContext:
+    return AgentContext(
+        items=items,
+        compaction_model=ModelConfig(name="gpt-test"),
+        text_message_compaction_keep_last_messages=10,
+        tool_call_compaction_keep_last_turns=10,
+    )
+
+
+@pytest.mark.parametrize(
+    "malformed_tail",
+    [
+        [
+            AgentContextItem(
+                item_id="calls",
+                role="assistant",
+                tool_calls=[
+                    _tool_call("call-alpha", "inspect_trace"),
+                    _tool_call("call-beta", "inspect_source"),
+                ],
+            ),
+            AgentContextItem(
+                item_id="partial-result",
+                role="tool",
+                content="trace receipt",
+                tool_call_id="call-alpha",
+            ),
+        ],
+        [
+            AgentContextItem(
+                item_id="call",
+                role="assistant",
+                tool_calls=[_tool_call("call-alpha", "inspect_trace")],
+            ),
+            AgentContextItem(
+                item_id="mismatched-result",
+                role="tool",
+                content="orphaned receipt",
+                tool_call_id="call-other",
+            ),
+        ],
+        [
+            AgentContextItem(
+                item_id="orphaned-result",
+                role="tool",
+                content="orphaned receipt",
+                tool_call_id="call-missing",
+            )
+        ],
+    ],
+)
+def test_halo_035_trims_missing_mismatched_and_malformed_replay_tails(
+    malformed_tail: list[AgentContextItem],
+) -> None:
+    stable_prefix = [
+        AgentContextItem(item_id="system", role="system", content="system"),
+        AgentContextItem(item_id="user", role="user", content="continue"),
+    ]
+    context = _replay_context([*stable_prefix, *malformed_tail])
+
+    removed = context.trim_incomplete_tool_turn(min_items=len(stable_prefix))
+
+    assert removed == malformed_tail
+    assert context.to_messages_array() == [
+        AgentMessage(role="system", content="system"),
+        AgentMessage(role="user", content="continue"),
+    ]
+
+
+def test_halo_035_final_answer_emits_once_and_keeps_a_replayable_pair() -> None:
+    sdk_agent: Agent[object] = Agent(name="root")
+    execution = AgentExecution(
+        agent_id="root-1",
+        agent_name="Root",
+        depth=0,
+        parent_agent_id=None,
+        parent_tool_call_id=None,
+    )
+    mapper = OpenAiEventMapper()
+    call = ToolCallItem(
+        agent=sdk_agent,
+        raw_item={
+            "type": "function_call",
+            "call_id": "call-final",
+            "name": "final_answer",
+            "arguments": '{"answer": "sanitized final report"}',
+        },
+    )
+    mapped_call = mapper.to_mapped_event(
+        RunItemStreamEvent(name="tool_called", item=call),
+        execution=execution,
+        is_root=True,
+    )
+
+    assert mapped_call.output_item is not None
+    assert mapped_call.output_item.final
+    assert mapped_call.output_item.item == AgentMessage(
+        role="assistant",
+        content="sanitized final report",
+    )
+    assert mapped_call.context_item is not None
+
+    output = ToolCallOutputItem(
+        agent=sdk_agent,
+        raw_item={
+            "type": "function_call_output",
+            "call_id": "call-final",
+            "output": "acknowledged",
+        },
+        output="acknowledged",
+    )
+    mapped_output = mapper.to_mapped_event(
+        RunItemStreamEvent(name="tool_output", item=output),
+        execution=execution,
+        is_root=True,
+    )
+
+    assert mapped_output.output_item is None
+    assert mapped_output.context_item is not None
+    replay = _replay_context([mapped_call.context_item, mapped_output.context_item])
+    assert to_responses_input(replay.to_messages_array()) == [
+        {
+            "type": "function_call",
+            "call_id": "call-final",
+            "name": "final_answer",
+            "arguments": '{"answer": "sanitized final report"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-final",
+            "output": "acknowledged",
+        },
+    ]
 
 
 def test_trace_index_process_pool_is_unavailable_when_semaphore_query_is_denied(
@@ -297,7 +606,9 @@ def test_halo_engine_environment_sets_and_restores_runtime_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CATALYST_OTLP_ENDPOINT", "http://127.0.0.1:4318")
-    monkeypatch.setenv("CATALYST_SERVICE_NAME", "previous-service")
+    monkeypatch.setenv("INFERENCE_OTLP_ENDPOINT", "http://127.0.0.1:4999")
+    monkeypatch.setenv("INFERENCE_SERVICE_NAME", "previous-service")
+    monkeypatch.setenv("HALO_TRACING_RUN_ID", "previous-run")
     monkeypatch.delenv("HALO_TELEMETRY_PATH", raising=False)
     config = cast(
         HaloConfig,
@@ -309,12 +620,15 @@ def test_halo_engine_environment_sets_and_restores_runtime_values(
     )
 
     with _halo_engine_environment(config, tmp_path):
-        assert os.environ["CATALYST_OTLP_ENDPOINT"] == "http://127.0.0.1:4318"
-        assert os.environ["CATALYST_SERVICE_NAME"] == "shea-halo"
+        assert os.environ["INFERENCE_OTLP_ENDPOINT"] == "http://127.0.0.1:4318"
+        assert os.environ["INFERENCE_SERVICE_NAME"] == "shea-halo"
+        assert os.environ["HALO_TRACING_RUN_ID"] == tmp_path.parent.name
         assert os.environ["HALO_TELEMETRY_PATH"] == str(tmp_path / "halo-telemetry.jsonl")
 
     assert os.environ["CATALYST_OTLP_ENDPOINT"] == "http://127.0.0.1:4318"
-    assert os.environ["CATALYST_SERVICE_NAME"] == "previous-service"
+    assert os.environ["INFERENCE_OTLP_ENDPOINT"] == "http://127.0.0.1:4999"
+    assert os.environ["INFERENCE_SERVICE_NAME"] == "previous-service"
+    assert os.environ["HALO_TRACING_RUN_ID"] == "previous-run"
     assert "HALO_TELEMETRY_PATH" not in os.environ
 
 
@@ -491,6 +805,7 @@ async def test_analysis_persists_only_sanitized_logical_artifacts(
     assert "<workspace>/src/agent.py" in report
     assert "<engine-temporary>/halo-telemetry.jsonl" in report
     assert manifest["dataset"]["files"][0]["path"].startswith("workspace:")
+    assert manifest["halo_engine_version"] == "0.3.5"
     assert manifest["api_mode"] == "chat_completions"
     assert manifest["report_path"] == "report.md"
     assert manifest["events_path"] == "events.jsonl"

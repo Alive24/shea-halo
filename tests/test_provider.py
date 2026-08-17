@@ -63,7 +63,8 @@ def test_bootstrap_disables_openai_sdk_retries(monkeypatch: pytest.MonkeyPatch) 
     assert getattr(provider, "_client").max_retries == 0
 
 
-def test_unsupported_route_becomes_a_safe_structured_error() -> None:
+@pytest.mark.parametrize("api_mode", ["responses", "chat_completions"])
+def test_unsupported_route_becomes_a_safe_structured_error(api_mode: ApiMode) -> None:
     request = httpx.Request(
         "POST",
         "https://provider.invalid/v1/responses?api_key=secret-runtime-key",
@@ -75,19 +76,20 @@ def test_unsupported_route_becomes_a_safe_structured_error() -> None:
     )
 
     with pytest.raises(ProviderApiModeError) as raised:
-        OpenAIModelBootstrap("responses").reraise_if_unsupported(error)
+        OpenAIModelBootstrap(api_mode).reraise_if_unsupported(error)
 
-    assert raised.value.api_mode == "responses"
+    assert raised.value.api_mode == api_mode
     assert raised.value.status_code == 404
     assert "secret-runtime-key" not in str(raised.value)
     assert "provider.invalid" not in str(raised.value)
 
 
-def test_non_route_status_is_not_reclassified() -> None:
+@pytest.mark.parametrize("status_code", [400, 500])
+def test_non_route_status_is_not_reclassified(status_code: int) -> None:
     request = httpx.Request("POST", "https://provider.invalid/v1/responses")
     error = APIStatusError(
         "provider failed",
-        response=httpx.Response(500, request=request),
+        response=httpx.Response(status_code, request=request),
         body=None,
     )
 

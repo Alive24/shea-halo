@@ -43,7 +43,7 @@ class HaloEngineError(RuntimeError):
 
 @contextmanager
 def _halo_engine_without_sdk_retries() -> Iterator[None]:
-    """Patch HALO 0.2.1's public client construction for one serial engine run."""
+    """Patch HALO 0.3.5's public client construction for one serial engine run."""
 
     import engine.main as engine_main
 
@@ -531,10 +531,14 @@ def _halo_engine_environment(
     telemetry_path: Path | None = None,
 ) -> Iterator[None]:
     overrides = {
-        "CATALYST_OTLP_ENDPOINT": effective_catalyst_sdk_base_endpoint(
+        # HALO Engine 0.3.5 documents the INFERENCE_* names at its telemetry
+        # boundary. Shea still resolves the operator's loopback-only Catalyst
+        # setting, then passes only the normalized endpoint into the engine run.
+        "INFERENCE_OTLP_ENDPOINT": effective_catalyst_sdk_base_endpoint(
             config.observation.catalyst_sdk_base_endpoint
         ),
-        "CATALYST_SERVICE_NAME": "shea-halo",
+        "INFERENCE_SERVICE_NAME": "shea-halo",
+        "HALO_TRACING_RUN_ID": run_dir.parent.name,
         "HALO_TELEMETRY_PATH": str(telemetry_path or run_dir / "halo-telemetry.jsonl"),
     }
     previous = {name: os.environ.get(name) for name in overrides}
@@ -689,9 +693,12 @@ class HaloEngineAdapter:
             final_message = ""
             temporary_events_path = temporary_root / "events.jsonl"
             model_bootstrap = OpenAIModelBootstrap(config.api_mode)
-            # HALO Engine 0.2.1 accepts an AsyncOpenAI connection but not the API
-            # shape. Its public entrypoint constructs OpenAIProvider on first
-            # iteration, so set the SDK's public default immediately beforehand.
+            # HALO Engine 0.3.5 replays its retained chat-shaped history as
+            # Responses input items. The Agents SDK then preserves those items
+            # directly for Responses or converts them to paired Chat Completions
+            # messages (including content=None on tool-call-only assistant rows).
+            # Its public entrypoint constructs OpenAIProvider on first iteration,
+            # so select the explicit SDK API mode immediately beforehand.
             # HaloService processes target configs serially, preventing cross-mode
             # overlap between engine runs.
             model_bootstrap.configure_sdk_default()

@@ -138,6 +138,18 @@ Desktop-to-JSONL bridge and no Shea-specific receiver.
 
 An experimental code change cannot move to `Todo` from source diff and model claims alone. Halo requires a successful post-publication runtime experiment, a new or changed canonical candidate trace with an actual parent/child hierarchy, post-experiment HALO Engine analysis of exactly that candidate dataset, passing deterministic verification, and the exact published candidate revision. The same trace contract applies when a tracing experiment concludes `no_change`. A HALO Desktop report remains useful supplemental evidence when available, but is not a promotion requirement. Missing required evidence leaves the item in `Halo Research` for the next re-entry.
 
+Shea Halo pins HALO Engine 0.3.5 and keeps both configured OpenAI API modes
+explicit. HALO retains completed tool history in its typed chat-shaped context
+and renders it as paired Responses `function_call` / `function_call_output`
+items for replay. In `chat_completions` mode, the pinned Agents SDK converts the
+same items to ordered assistant/tool messages with stable call identifiers and
+an explicit `content: null` on tool-call-only assistant rows. Shea does not drop
+completed tool turns or silently change API mode when a provider rejects that
+shape; the existing structured provider-mode blocker remains authoritative.
+HALO's `final_answer` call/result pair stays in replay history while its answer
+is emitted once as the sanitized final report. No local replay monkey patch or
+checkpoint persistence is enabled.
+
 HALO Engine artifacts are local and ignored under `.shea/artifacts/halo/<run-id>/halo-engine/`:
 
 - `analysis.json` — a versioned manifest with logical trace labels, digests, and run provenance;

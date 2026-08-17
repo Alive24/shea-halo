@@ -14,8 +14,8 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-  "halo-engine==0.2.1",
-  "inference-catalyst-tracing[openai-agents]==0.1.8",
+  "halo-engine==0.3.5",
+  "inference-catalyst-tracing[openai-agents]==0.1.10",
   "openai-agents==0.14.7",
   "opentelemetry-exporter-otlp-proto-common==1.44.0",
   "opentelemetry-sdk==1.44.0",
